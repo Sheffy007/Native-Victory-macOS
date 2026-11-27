@@ -7,13 +7,17 @@
 
 use super::addr::{self, Mapping, Pages, Pairs};
 use super::descriptors::{Decoded, Res, decode, typed_buffer};
-use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
+use super::list::{
+    Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, StageHeapAccess, StageHeapElem, Targets,
+};
 use super::memory::PoolTable;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use victory_backend::backend::{Dispatch, Heaps, RootArgs};
+use victory_backend::backend::{
+    Dispatch, HeapAccess, HeapRange, Heaps, RootArgs, STAGE_FIRST, STAGE_FRAGMENT,
+};
 use victory_backend::resources::*;
 
 #[cfg(test)]
@@ -159,6 +163,9 @@ impl<B: GraphicsBackend> Clone for Prep<B> {
             indirect: self.indirect.clone(),
             count: self.count.clone(),
             heap: self.heap.clone(),
+            heap_all_stages: self.heap_all_stages,
+            heap_all_writes: self.heap_all_writes,
+            heap_ranges: self.heap_ranges,
         }
     }
 }
@@ -179,6 +186,72 @@ struct Prep<B: GraphicsBackend> {
     count: Option<(Rc<B::Buffer>, *const u8, u32)>,
     /// The resource heap the work needs in place of the one the title bound (none bound).
     heap: Option<Rc<NativeHeap<B>>>,
+    /// Unbounded stage bits (`STAGE_FIRST`, `STAGE_FRAGMENT`), whether any unbounded stage may
+    /// write to the resource heap, and `[start, end)` into `execute`'s shared `HeapRange` buffer.
+    heap_all_stages: u8,
+    heap_all_writes: bool,
+    heap_ranges: (usize, usize),
+}
+
+fn push_stage_heap_ranges<B: GraphicsBackend>(
+    stage: &StageHeapAccess,
+    fragment: bool,
+    root: &[Option<Root<B>>],
+    bound_heap: Option<&Rc<NativeHeap<B>>>,
+    p: &mut Prep<B>,
+    ranges_from: usize,
+    ranges: &mut Vec<HeapRange>,
+) {
+    if stage.unbounded {
+        p.heap_all_stages |= if fragment { STAGE_FRAGMENT } else { STAGE_FIRST };
+        p.heap_all_writes |= stage.unbounded_writes;
+        if stage.unbounded_writes {
+            return;
+        }
+    }
+    let max_idx = victory_shader::emit::HEAP_VIEWS as usize - 1;
+    let mut push = |start: usize, end: usize, writes: bool| {
+        if start >= end || (stage.unbounded && !writes) {
+            return;
+        }
+        if ranges.len() > ranges_from
+            && let Some(last) = ranges.last_mut()
+            && last.end == start
+            && last.writes == writes
+            && last.fragment == fragment
+        {
+            last.end = end;
+        } else {
+            ranges.push(HeapRange {
+                start,
+                end,
+                writes,
+                fragment,
+            });
+        }
+    };
+    for &elem in &stage.bounded {
+        match elem {
+            StageHeapElem::Table { slot, offset, writes } => {
+                if let Some(Some(Root::Table(h, at))) = root.get(usize::from(slot))
+                    && h.kind == HeapKind::Resource
+                {
+                    let idx = (*at + offset as usize).min(max_idx);
+                    push(idx, idx + 1, writes);
+                }
+            }
+            StageHeapElem::Pairs { writes } => {
+                if let Some(bh) = bound_heap {
+                    let pairs = bh.pairs.get().1;
+                    push(bh.count, bh.count + 2 * pairs, writes);
+                }
+            }
+            StageHeapElem::Fixed { index, writes } => {
+                let idx = (index as usize).min(max_idx);
+                push(idx, idx + 1, writes);
+            }
+        }
+    }
 }
 
 /// The bytes of an `ExecuteIndirect` argument record of `cmd`'s kind.
@@ -2305,7 +2378,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
             .collect()
     }
 
-    fn prep(&self, cmd: &Cmd<B>) -> Result<Prep<B>, String> {
+    fn prep(&self, cmd: &Cmd<B>, ranges: &mut Vec<HeapRange>) -> Result<Prep<B>, String> {
+        let range_start = ranges.len();
         let mut p = Prep {
             root: RootArgs::default(),
             ps_root: None,
@@ -2316,6 +2390,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
             indirect: None,
             count: None,
             heap: None,
+            heap_all_stages: 0,
+            heap_all_writes: false,
+            heap_ranges: (range_start, range_start),
         };
         self.forget_released();
         match cmd {
@@ -2358,8 +2435,23 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     if b.view_addresses {
                         self.view_address_args(heaps.0.as_ref(), &mut p)?;
                     }
+                    let bh = p.heap.clone().or_else(|| heaps.0.clone());
+                    push_stage_heap_ranges(
+                        &b.heap_access,
+                        false,
+                        root,
+                        bh.as_ref(),
+                        &mut p,
+                        range_start,
+                        ranges,
+                    );
+                    p.heap_ranges = (range_start, ranges.len());
                 }
-                None => self.root_args(root, &mut p)?,
+                None => {
+                    self.root_args(root, &mut p)?;
+                    p.heap_all_stages = STAGE_FIRST;
+                    p.heap_all_writes = true;
+                }
             }},
             Cmd::Draw {
                 root,
@@ -2422,6 +2514,40 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 if let Some((a, _)) = index {
                     p.index = Some(self.resolve(*a, 1)?);
                 }
+                match binding {
+                    Some(b) => {
+                        let bh = p.heap.clone().or_else(|| heaps.0.clone());
+                        push_stage_heap_ranges(
+                            &b.heap_access,
+                            false,
+                            root,
+                            bh.as_ref(),
+                            &mut p,
+                            range_start,
+                            ranges,
+                        );
+                        if let Some(ps_access) = b
+                            .ps_heap_access
+                            .as_ref()
+                            .or_else(|| b.ps.as_ref().map(|ps| &ps.heap_access))
+                        {
+                            push_stage_heap_ranges(
+                                ps_access,
+                                true,
+                                root,
+                                bh.as_ref(),
+                                &mut p,
+                                range_start,
+                                ranges,
+                            );
+                        }
+                        p.heap_ranges = (range_start, ranges.len());
+                    }
+                    None => {
+                        p.heap_all_stages = STAGE_FIRST | STAGE_FRAGMENT;
+                        p.heap_all_writes = true;
+                    }
+                }
             }
             Cmd::Copy { dst, src, len } => {
                 p.blit.push(self.resolve(*src, *len as u64)?);
@@ -2479,6 +2605,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let trace = env_set!("VICTORY_TRACE_TARGETS");
         let mut cmds: Vec<&Cmd<B>> = Vec::new();
         let mut preps = Vec::new();
+        let mut heap_ranges: Vec<HeapRange> = Vec::new();
         // Whether a pass ends before the kept command of that index, and the commands dropped since
         // the last kept one.
         let mut cut: Vec<bool> = Vec::new();
@@ -2525,7 +2652,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             // Reported from this one preparation: preparing again for the trace would mirror tables
             // and write view pairs twice.
-            let prepared = self.prep(c);
+            let prepared = self.prep(c, &mut heap_ranges);
             #[cfg(target_os = "macos")]
             if noted {
                 self.pass_at_submit(exec, &lists[li].notes, li, ci, c);
@@ -2666,6 +2793,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     sampler: h.1.as_ref().map(|s| &s.heap),
                                 },
                                 None => heaps(h),
+                            },
+                            heap_access: HeapAccess {
+                                all_stages: preps[k].heap_all_stages,
+                                all_writes: preps[k].heap_all_writes,
+                                ranges: &heap_ranges[preps[k].heap_ranges.0..preps[k].heap_ranges.1],
                             },
                             groups: *groups,
                             threads_per_group: pso.threads,
@@ -2862,6 +2994,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                             sampler: h.1.as_ref().map(|s| &s.heap),
                                         },
                                         None => heaps(h),
+                                    },
+                                    heap_access: HeapAccess {
+                                        all_stages: preps[k].heap_all_stages,
+                                        all_writes: preps[k].heap_all_writes,
+                                        ranges: &heap_ranges[preps[k].heap_ranges.0..preps[k].heap_ranges.1],
                                     },
                                     resources: preps[k].bufs.iter().map(|b| &**b).collect(),
                                     vertex_buffers: preps[k]

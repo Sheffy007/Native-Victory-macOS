@@ -1,7 +1,7 @@
 //! Descriptor heaps, textures, samplers and render passes: the second slice of the seam (`backend`
 //! has queues, fences and compute). Platform neutral, no Metal types.
 
-use crate::backend::{ComputeBackend, Dispatch, Heaps, RootArgs, RootLayout};
+use crate::backend::{ComputeBackend, Dispatch, HeapAccess, Heaps, RootArgs, RootLayout};
 
 /// Which descriptor heap type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -630,6 +630,7 @@ pub struct Draw<'a, B: GraphicsBackend + ?Sized> {
     /// The pixel stage's own argument block, if it has one (else it reads `root`).
     pub fragment_root: Option<RootArgs>,
     pub heaps: Heaps<'a, B>,
+    pub heap_access: HeapAccess<'a>,
     pub resources: Vec<&'a B::Buffer>,
     /// `(input slot, buffer, title address)` for each bound vertex stream.
     pub vertex_buffers: Vec<(usize, &'a B::Buffer, *const u8)>,

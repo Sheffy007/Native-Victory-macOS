@@ -1972,3 +1972,397 @@ fn a_pixel_shader_with_only_view_addresses_gets_its_own_fragment_root() {
     }
     drop(records);
 }
+
+#[test]
+fn encoder_residency_scopes_bounded_passes_and_batches_bindless_passes() {
+    if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()
+        && std::env::var_os("VICTORY_MSC_DYLIB").is_none()
+    {
+        eprintln!("skipped: Metal Shader Converter not installed");
+        return;
+    }
+    let mut t = Title::new(
+        Metal::new().unwrap().with_residency_sets(false),
+        std::sync::Arc::new(crate::native::memory::PoolTable::default()),
+    );
+    let f = super::addr_tests::Fixture::new(&t);
+    f.put(0x2_1000, &[0xCAFE_BABEu32]);
+
+    // Populate a 260-entry heap:
+    // - 0..256: 256 distinct 1x1 Rgba8Unorm SRV textures (`[i, 255 - i, 64, 255]`)
+    // - 256: 1x1 Rgba8Unorm UAV texture (`unordered_access = true`)
+    // - 257: raw placed UAV buffer at `VA_A`
+    // - 258: raw placed SRV buffer at `VA_A + 0x1000`
+    const N_SRV: usize = 256;
+    const TOTAL: usize = N_SRV + 3;
+    let records = vec![0u32; 8 * TOTAL];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, TOTAL).unwrap();
+    let res_iid = crate::object::guid(
+        0x696442be,
+        0xa72e,
+        0x4059,
+        [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+    );
+    let make_tex_obj = |flags: u32| -> crate::object::This {
+        let words = [3u32, 0, 0, 0, 1, 0, 1, 1 | 1 << 16, 28, 1, 0, 1, flags, 0];
+        let mut out = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                0x1_0000,
+                words.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &res_iid,
+                &mut out,
+            ),
+            0,
+        );
+        out
+    };
+    let mut com_objs = Vec::with_capacity(N_SRV + 1);
+    for i in 0..N_SRV {
+        let tex = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap();
+        let px = [i as u8, (255 - i) as u8, 64, 255];
+        t.host.backend.upload_texture(&tex, 0, 0, &px, 4, 0);
+        let obj = make_tex_obj(0);
+        com_objs.push(obj);
+        t.host.register_texture(obj as usize, &tex);
+        let mut srv = [0u32; 10];
+        (srv[0], srv[1], srv[5]) = (28, 4, 1);
+        let slot = start + 32 * i as u64;
+        crate::descriptor::create_srv(std::ptr::null(), obj, &srv, slot);
+        assert!(t.host.mirror(slot).unwrap());
+    }
+    let mut uav_desc = TextureDesc::d2(Format::Rgba8Unorm, 1, 1);
+    uav_desc.unordered_access = true;
+    let uav_tex = t.host.texture(&uav_desc).unwrap();
+    let uav_obj = make_tex_obj(4);
+    com_objs.push(uav_obj);
+    t.host.register_texture(uav_obj as usize, &uav_tex);
+    let mut uav_img = [0u32; 10];
+    (uav_img[0], uav_img[1]) = (28, 4);
+    crate::descriptor::create_uav(std::ptr::null(), uav_obj, std::ptr::null(), &uav_img, start + 256 * 32);
+    assert!(t.host.mirror(start + 256 * 32).unwrap());
+
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut buf_uav = [0u32; 16];
+    (buf_uav[1], buf_uav[4], buf_uav[8]) = (1, 64, 1);
+    [buf_uav[10], buf_uav[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &buf_uav, start + 257 * 32);
+    assert!(t.host.mirror(start + 257 * 32).unwrap());
+    let mut buf_srv = buf_uav;
+    (buf_srv[4], buf_srv[6]) = (0, 64);
+    [buf_srv[10], buf_srv[11]] = super::addr_tests::halves(super::addr_tests::VA_A + 0x1000);
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &buf_srv, start + 258 * 32);
+    assert!(t.host.mirror(start + 258 * 32).unwrap());
+
+    // 1. Render pass whose VS and PS never access the resource heap (`COVER` + `RED`), even with
+    // `set_heaps` bound on the list: names 0 heap resources instead of 259.
+    let (vs_cover, ps_red) = (translate(HwStage::Vs, COVER), translate(HwStage::Ps, RED));
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso_plain, bind_plain) = t.render_pipe(&vs_cover, Some(&ps_red), &state, "plain") else {
+        panic!("{:?}", t.shaders);
+    };
+    let mut rt_desc = TextureDesc::d2(Format::Rgba8Unorm, 4, 4);
+    rt_desc.render_target = true;
+    let rt = t.host.texture(&rt_desc).unwrap();
+    let before = t.host.backend.residency_counts().heap_resources;
+    let mut l = NativeList::default();
+    l.set_render_targets(std::slice::from_ref(&rt), None);
+    l.set_heaps(Some(&heap), None);
+    l.set_graphics_pipeline(&pso_plain, Topology::Triangles);
+    l.set_graphics_binding(bind_plain);
+    l.draw_instanced(3, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.host.backend.residency_counts().heap_resources - before, 0);
+    let mut px = [0u8; 4 * 4 * 4];
+    t.host.backend.read_texture(&rt, 0, 0, &mut px, 16, 0);
+    assert!(px.chunks(4).all(|c| c == [255, 128, 128, 255]));
+
+    // 2. Bounded compute pass writing a UAV texture (`table_uav[0]` = entry 256) from an SRV
+    // texture (`table_srv[0]` = entry 42), followed in the same submission by a bounded render pass
+    // reading `table[0]` = entry 256: proves both scoped counts (3 and 2 instead of 259) and
+    // Metal's UAV Write -> SRV Read hazard ordering without residency sets.
+    const CS_COPY_TEX: &[u32] = &[
+        0xBE8A_0304, // s_mov_b32 s10, s4 (table 0: SRV)
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xBE8E_0306, // s_mov_b32 s14, s6 (table 1: UAV)
+        0xBE8F_0380, // s_mov_b32 s15, 0
+        0xF40C_0405, 0xFA00_0000, // s_load_dwordx8 s[16:23], s[10:11], 0x0
+        0xF40C_0607, 0xFA00_0000, // s_load_dwordx8 s[24:31], s[14:15], 0x0
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF000_1F08, 0x0004_0200, // image_load v[2:5], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF020_1F08, 0x0006_0200, // image_store v[2:5], v[0:1], s[24:31] dmask:0xf dim:2D unorm
+        0xBF81_0000, // s_endpgm
+    ];
+    let mut rec_srv = [0u8; 32];
+    rec_srv[0] = 0x41;
+    rec_srv[4..6].copy_from_slice(&[2, 3]);
+    rec_srv[16] = 1;
+    rec_srv[20..23].copy_from_slice(&[8, 4, 0]);
+    let mut rec_uav = [0u8; 32];
+    rec_uav[0] = 0x41;
+    rec_uav[4..6].copy_from_slice(&[3, 3]);
+    (rec_uav[6], rec_uav[16]) = (1, 1);
+    rec_uav[20..23].copy_from_slice(&[8, 6, 1]);
+    let cs_copy = shaders::translate(&crate::pipeline::test_compute_container(CS_COPY_TEX, &[rec_srv, rec_uav], 8)).unwrap();
+    let Pipe::Compute(pso_copy) = t.compute_pipe(&cs_copy, "copy tex") else { panic!("{:?}", t.shaders) };
+    assert!(!pso_copy.binding.as_ref().unwrap().heap_access.unbounded);
+
+    const PS_TABLE: &[u32] = &[
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF40C_0101, 0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], 0x0
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF000_1F08, 0x0001_0000, // image_load v[0:3], v[0:1], s[4:11] dmask:0xf dim:2D unorm
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF800_180F, 0x0302_0100, // exp mrt0 v0, v1, v2, v3 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let mut ps_meta = [0u8; 0x30];
+    ps_meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    ps_meta[0x10] = 0x41;
+    ps_meta[0x14..0x16].copy_from_slice(&[2, 3]);
+    ps_meta[0x20] = 1;
+    ps_meta[0x24..0x27].copy_from_slice(&[8, 2, 0]);
+    let ps_bytes: Vec<_> = PS_TABLE.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let ps_table = shaders::translate(
+        &victory_shader::emit::graphics::container(HwStage::Ps, &ps_bytes, &ps_meta).unwrap(),
+    )
+    .unwrap();
+    let Pipe::Render(pso_sample, bind_sample) = t.render_pipe(&vs_cover, Some(&ps_table), &state, "ps table") else {
+        panic!("{:?}", t.shaders);
+    };
+
+    let before = t.host.backend.residency_counts().heap_resources;
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_copy);
+    l.set_compute_root_table(0, &heap, 42);
+    l.set_compute_root_table(1, &heap, 256);
+    l.dispatch(1, 1, 1).unwrap();
+    l.set_render_targets(std::slice::from_ref(&rt), None);
+    l.set_graphics_pipeline(&pso_sample, Topology::Triangles);
+    l.set_graphics_binding(bind_sample);
+    l.set_graphics_root_table(0, &heap, 256);
+    l.draw_instanced(3, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&l]);
+    // Compute pass: heap.buf + tex[42] + uav_tex[256] = 3.
+    // Render pass:  heap.buf + uav_tex[256]           = 2. Total = 5 (vs 2 * 259 = 518).
+    assert_eq!(t.host.backend.residency_counts().heap_resources - before, 5);
+    t.host.backend.read_texture(&rt, 0, 0, &mut px, 16, 0);
+    assert!(
+        px.chunks(4).all(|c| c == [42, 255 - 42, 64, 255]),
+        "got {:?}",
+        &px[..4]
+    );
+
+    // 3. Bounded `Lower::memory` + `view_addresses` compute pass (`CS_VIEW_ADDRESS`) over entries
+    // 257..259: names only `heap.buf` + null buffer + the pool buffer = 3 resources (0 of the 256
+    // unrelated textures!).
+    let rec = |kind: u8, offset: u8, register: u8| {
+        let mut r = [0u8; 32];
+        r[0] = 0x41;
+        r[4..6].copy_from_slice(&[kind, 3]);
+        (r[8], r[12], r[16]) = (offset, register, 1);
+        r[20..23].copy_from_slice(&[4, 4, 0]);
+        r
+    };
+    let cs_va = shaders::translate(&crate::pipeline::test_compute_container(
+        CS_VIEW_ADDRESS,
+        &[rec(3, 0, 0), rec(0, 8, 1)],
+        7,
+    ))
+    .unwrap();
+    let Pipe::Compute(pso_va) = t.compute_pipe(&cs_va, "va") else { panic!("{:?}", t.shaders) };
+    assert!(!pso_va.binding.as_ref().unwrap().heap_access.unbounded);
+    let before = t.host.backend.residency_counts().heap_resources;
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_va);
+    l.set_compute_root_table(0, &heap, 257);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.host.backend.residency_counts().heap_resources - before, 3);
+    assert_eq!(f.get(0x2_0000, 2), [0xCAFE_BABE, super::addr_tests::CANARY]);
+
+    // 4. Waterfall dynamic-offset table read + bounded UAV store (`CS_TABLE_SCC_CARRY`):
+    // `unbounded == true` and `unbounded_writes == false`, naming all allocations via batched
+    // `useResources` while keeping non-ShaderWrite textures `Read` and writing entry 257 accurately.
+    f.put(0x2_0000, &[0u32]);
+    let mut wf_srv = rec_srv;
+    wf_srv[12] = 1;
+    wf_srv[16] = 2;
+    let mut wf_uav = rec(3, 16, 0);
+    wf_uav[6] = 0;
+    let cs_wf = shaders::translate(&crate::pipeline::test_compute_container(
+        CS_TABLE_SCC_CARRY,
+        &[wf_srv, wf_uav],
+        7,
+    ))
+    .unwrap();
+    let Pipe::Compute(pso_wf) = t.compute_pipe(&cs_wf, "wf") else { panic!("{:?}", t.shaders) };
+    let wf_access = &pso_wf.binding.as_ref().unwrap().heap_access;
+    assert!(wf_access.unbounded && !wf_access.unbounded_writes, "{wf_access:?}");
+    let before = t.host.backend.residency_counts().heap_resources;
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso_wf);
+    l.set_compute_root_table(0, &heap, 255); // entry 255 + 1 = 256 (UAV tex), entry 255 + 2 = 257 (buf UAV)
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    // 1 (`heap.buf`) + 256 SRV textures + 1 UAV texture + 1 null buffer + 1 pool buffer = 260.
+    assert_eq!(t.host.backend.residency_counts().heap_resources - before, 260);
+    // Green channel of entry 256 (`(255 - 42) / 255.0` stored earlier by `CS_COPY_TEX`):
+    let got = f32::from_bits(f.get(0x2_0000, 1)[0]);
+    assert!((got - (213.0 / 255.0)).abs() < 1e-4, "got {got}");
+    for obj in com_objs {
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(obj, 0x10)(obj);
+    }
+    drop(records);
+}
+
+#[test]
+#[ignore = "benchmark: cargo test -p victory-gpu per_encoder_residency_10k_textures_benchmark -- --ignored --nocapture"]
+fn per_encoder_residency_10k_textures_benchmark() {
+    if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()
+        && std::env::var_os("VICTORY_MSC_DYLIB").is_none()
+    {
+        eprintln!("skipped: Metal Shader Converter not installed");
+        return;
+    }
+    let mut t = Title::new(
+        Metal::new().unwrap().with_residency_sets(false),
+        std::sync::Arc::new(crate::native::memory::PoolTable::default()),
+    );
+    let f = super::addr_tests::Fixture::new(&t);
+    const TEX_COUNT: usize = 10_000;
+    let records = vec![0u32; 8 * (TEX_COUNT + 2)];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, TEX_COUNT + 2).unwrap();
+    for i in 0..TEX_COUNT {
+        let tex = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 4, 4)).unwrap();
+        let key = 0xBEEF_0000 + i;
+        t.host.register_texture(key, &tex);
+        let mut srv = [0u32; 10];
+        (srv[0], srv[1], srv[5]) = (28, 4, 1);
+        let slot = start + 32 * i as u64;
+        crate::descriptor::create_srv(std::ptr::null(), key as _, &srv, slot);
+        assert!(t.host.mirror(slot).unwrap());
+    }
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut buf_uav = [0u32; 16];
+    (buf_uav[1], buf_uav[4], buf_uav[8]) = (1, 64, 1);
+    [buf_uav[10], buf_uav[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &buf_uav, start + (TEX_COUNT as u64) * 32);
+    assert!(t.host.mirror(start + (TEX_COUNT as u64) * 32).unwrap());
+
+    let mut rec_srv = [0u8; 32];
+    rec_srv[0] = 0x41;
+    rec_srv[4..6].copy_from_slice(&[2, 3]);
+    rec_srv[16] = 1;
+    rec_srv[20..23].copy_from_slice(&[8, 4, 0]);
+    let mut rec_uav = [0u8; 32];
+    rec_uav[0] = 0x41;
+    rec_uav[4..6].copy_from_slice(&[3, 3]);
+    (rec_uav[8], rec_uav[16]) = (8, 1);
+    rec_uav[20..23].copy_from_slice(&[4, 4, 0]);
+    const CS_BOUNDED: &[u32] = &[
+        0xBE8A_0304, // s_mov_b32 s10, s4
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF40C_0405, 0xFA00_0000, // s_load_dwordx8 s[16:23], s[10:11], 0x0
+        0xF408_0305, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[10:11], 0x20
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF000_1F08, 0x0004_0200, // image_load v[2:5], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_0000, 0x8003_0200, // buffer_store_dword v2, off, s[12:15], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let cs_bounded = shaders::translate(&crate::pipeline::test_compute_container(
+        CS_BOUNDED,
+        &[rec_srv, rec_uav],
+        7,
+    ))
+    .unwrap();
+    let Pipe::Compute(pso_bounded) = t.compute_pipe(&cs_bounded, "bounded") else { panic!("{:?}", t.shaders) };
+    let (vs_cover, ps_red) = (translate(HwStage::Vs, COVER), translate(HwStage::Ps, RED));
+    let mut ps_dyn = vec![
+        0x8002_0402, // s_add_u32 s2, s2, s4 (dynamic root-constant offset into ResourceHeap)
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF40C_0101, 0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], 0x0
+    ];
+    ps_dyn.extend_from_slice(&PS_HEAP[3..]);
+    let mut dyn_meta = [0u8; 0x30];
+    dyn_meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    dyn_meta[0x10] = 0x41;
+    dyn_meta[0x14] = 2; // Root constants in slot 0 at user_data 4 (`s4`)
+    dyn_meta[0x24..0x26].copy_from_slice(&[1, 4]);
+    let dyn_bytes: Vec<_> = ps_dyn.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let ps_bindless = shaders::translate(
+        &victory_shader::emit::graphics::container(HwStage::Ps, &dyn_bytes, &dyn_meta).unwrap(),
+    )
+    .unwrap();
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso_plain, bind_plain) = t.render_pipe(&vs_cover, Some(&ps_red), &state, "plain") else { panic!("{:?}", t.shaders) };
+    let Pipe::Render(pso_bindless, bind_bindless) = t.render_pipe(&vs_cover, Some(&ps_bindless), &state, "bindless") else { panic!("{:?}", t.shaders) };
+    assert!(bind_bindless.as_ref().unwrap().ps_heap_access.as_ref().unwrap().unbounded);
+    let mut rt_desc = TextureDesc::d2(Format::Rgba8Unorm, 16, 16);
+    rt_desc.render_target = true;
+    let rt = t.host.texture(&rt_desc).unwrap();
+
+    // Warm-up submission.
+    {
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso_bounded);
+        l.set_compute_root_table(0, &heap, TEX_COUNT - 1);
+        l.dispatch(1, 1, 1).unwrap();
+        l.set_render_targets(std::slice::from_ref(&rt), None);
+        l.set_graphics_pipeline(&pso_bindless, Topology::Triangles);
+        l.set_graphics_binding(bind_bindless.clone());
+        l.set_graphics_root_constants(0, &[32]);
+        l.draw_instanced(3, 1, 0, 0).unwrap();
+        super::run(&t.host, &[&l]);
+    }
+
+    // Simulated world frame: 100 bounded compute + 100 render passes alternating with compute, plus
+    // 10 bindless render passes over a 10,000-texture heap (`with_residency_sets(false)`).
+    let before = t.host.backend.residency_counts().heap_resources;
+    let t0 = std::time::Instant::now();
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    for pass in 0..100 {
+        l.set_compute_pipeline(&pso_bounded);
+        l.set_compute_root_table(0, &heap, TEX_COUNT - 1);
+        l.dispatch(1, 1, 1).unwrap();
+        l.set_render_targets(std::slice::from_ref(&rt), None);
+        if pass % 10 == 0 {
+            l.set_graphics_pipeline(&pso_bindless, Topology::Triangles);
+            l.set_graphics_binding(bind_bindless.clone());
+            l.set_graphics_root_constants(0, &[(pass as u32) * 32]);
+        } else {
+            l.set_graphics_pipeline(&pso_plain, Topology::Triangles);
+            l.set_graphics_binding(bind_plain.clone());
+        }
+        l.draw_instanced(3, 1, 0, 0).unwrap();
+    }
+    super::run(&t.host, &[&l]);
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let named = t.host.backend.residency_counts().heap_resources - before;
+    println!(
+        "200 passes (190 bounded + 10 bindless) over 10,000-texture heap (residency_sets=false): {elapsed_ms:.2} ms total ({:.3} ms/pass), heap_resources named = {named} (vs {} unscoped)",
+        elapsed_ms / 200.0,
+        200 * (TEX_COUNT + 2)
+    );
+    drop((records, f));
+}

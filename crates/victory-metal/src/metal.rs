@@ -703,6 +703,7 @@ mod tests {
                 .address(mem.gpu(m, dst)),
             resources: vec![&mem.buf],
             heaps: Default::default(),
+            heap_access: Default::default(),
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
             indirect: None,

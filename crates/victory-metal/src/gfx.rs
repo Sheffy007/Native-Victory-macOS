@@ -5,7 +5,7 @@
 //! (`IRDescriptorTableSetBuffer` / `SetTexture` / `SetSampler`, 24-byte entries), so no Apple header
 //! is needed at build time.
 
-use crate::backend::{ComputeBackend, Heaps, RootArgs};
+use crate::backend::{ComputeBackend, HeapAccess, Heaps, RootArgs, STAGE_FIRST, STAGE_FRAGMENT};
 use crate::metal::{Buffer, Metal, Queue};
 use crate::resources::*;
 use objc2::Message;
@@ -17,6 +17,26 @@ use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 
 type Res = Retained<ProtocolObject<dyn MTLResource>>;
+type RawRes = NonNull<ProtocolObject<dyn MTLResource>>;
+type HeapEntryRef = (Res, bool, Option<Retained<ProtocolObject<dyn MTLTexture>>>);
+
+const STAGE_BIT_VERTEX: u8 = 1;
+const STAGE_BIT_MESH: u8 = 2;
+const STAGE_BIT_FRAGMENT: u8 = 4;
+
+fn render_stages(bits: u8) -> MTLRenderStages {
+    let mut s = MTLRenderStages::empty();
+    if bits & STAGE_BIT_VERTEX != 0 {
+        s |= MTLRenderStages::Vertex;
+    }
+    if bits & STAGE_BIT_MESH != 0 {
+        s |= MTLRenderStages::Mesh;
+    }
+    if bits & STAGE_BIT_FRAGMENT != 0 {
+        s |= MTLRenderStages::Fragment;
+    }
+    s
+}
 
 /// A fence chaining the encoders of one command buffer, and whether one has run: what a pass waits
 /// for and updates when the queue's buffers are made resident by a set instead of named.
@@ -44,22 +64,46 @@ pub struct Heap {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     kind: HeapKind,
     count: usize,
-    /// What each entry names: `(resident_allocation, optional_buffer_backed_texture_view)`.
+    /// What each entry names: `(resident_allocation, can_write, optional_buffer_backed_texture_view)`.
     /// A buffer-backed `TypeTextureBuffer` shares its parent `MTLBuffer`'s backing allocation, so
     /// retaining it here keeps its `gpuResourceID` live without duplicating the pool's pages in
-    /// `alloc_counts` / `MTLResidencySet` / per-encoder `useResource`.
-    refs: RefCell<std::collections::HashMap<usize, (Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>>,
+    /// `alloc_counts` / `MTLResidencySet` / per-encoder `useResources`.
+    refs: RefCell<std::collections::HashMap<usize, HeapEntryRef>>,
     /// Entries in `refs` that currently hold `Some(texture_buffer)`.
     typed_views: Cell<usize>,
-    /// The distinct allocations `refs` names, by raw `MTLResource` pointer, with how many entries
-    /// name each: an allocation is added to `set` once and removed + committed before its last
-    /// `refs` entry is dropped, and without a set each is named to an encoder once.
-    alloc_counts: RefCell<std::collections::HashMap<usize, (usize, Res)>>,
+    /// The distinct allocations `refs` names, by raw `MTLResource` pointer: `(count, can_write, res)`.
+    /// An allocation is added to `set` once and removed + committed before its last `refs` entry is
+    /// dropped; without sets, `alloc_slices` caches contiguous read-only and writable pointer lists.
+    alloc_counts: RefCell<std::collections::HashMap<usize, (usize, bool, Res)>>,
+    alloc_slices: RefCell<(Vec<RawRes>, Vec<RawRes>)>,
+    slices_dirty: Cell<bool>,
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
     /// The set asked to stay resident (`VICTORY_METAL_REQUEST_RESIDENCY`): it ends that when dropped.
     requested: bool,
+}
+
+impl Heap {
+    fn with_slices<R>(&self, f: impl FnOnce(&[RawRes], &[RawRes]) -> R) -> R {
+        if self.slices_dirty.replace(false) {
+            let counts = self.alloc_counts.borrow();
+            let mut slices = self.alloc_slices.borrow_mut();
+            let (ro, rw) = &mut *slices;
+            ro.clear();
+            rw.clear();
+            for (_, can_write, r) in counts.values() {
+                let ptr = NonNull::from(ProtocolObject::from_ref(&**r));
+                if *can_write {
+                    rw.push(ptr);
+                } else {
+                    ro.push(ptr);
+                }
+            }
+        }
+        let slices = self.alloc_slices.borrow();
+        f(&slices.0, &slices.1)
+    }
 }
 
 impl Drop for Heap {
@@ -516,7 +560,7 @@ impl Metal {
         heap: &Heap,
         index: usize,
         words: [u64; 3],
-        keep: Option<(Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>,
+        keep: Option<HeapEntryRef>,
     ) {
         assert!(
             index < heap.count,
@@ -537,40 +581,48 @@ impl Metal {
                 .enumerate()
                 .for_each(|(i, w)| p.add(i).write_volatile(*w));
         }
-        let added_typed = matches!(keep, Some((_, Some(_))));
+        let added_typed = matches!(keep, Some((_, _, Some(_))));
         let old = match keep {
-            Some((r, tex_view)) => {
+            Some((r, can_write, tex_view)) => {
                 let ptr = (&*r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
                 let mut counts = heap.alloc_counts.borrow_mut();
-                let (count, _) = counts.entry(ptr).or_insert_with(|| (0, r.clone()));
-                if *count == 0
-                    && let Some(set) = &heap.set
-                {
-                    set.addAllocation(ProtocolObject::from_ref(&*r));
-                    heap.dirty.set(true);
+                let (count, cw, _) = counts
+                    .entry(ptr)
+                    .or_insert_with(|| (0, can_write, r.clone()));
+                if !*cw && can_write {
+                    *cw = true;
+                    heap.slices_dirty.set(true);
+                }
+                if *count == 0 {
+                    heap.slices_dirty.set(true);
+                    if let Some(set) = &heap.set {
+                        set.addAllocation(ProtocolObject::from_ref(&*r));
+                        heap.dirty.set(true);
+                    }
                 }
                 *count += 1;
                 drop(counts);
-                heap.refs.borrow_mut().insert(index, (r, tex_view))
+                heap.refs.borrow_mut().insert(index, (r, can_write, tex_view))
             }
             None => heap.refs.borrow_mut().remove(&index),
         };
-        let removed_typed = matches!(old, Some((_, Some(_))));
+        let removed_typed = matches!(old, Some((_, _, Some(_))));
         if added_typed != removed_typed {
             let n = heap.typed_views.get();
             heap.typed_views
                 .set(if added_typed { n + 1 } else { n - 1 });
         }
-        if let Some((old, old_tex_view)) = old {
+        if let Some((old, _, old_tex_view)) = old {
             let old_ptr = (&*old as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let mut counts = heap.alloc_counts.borrow_mut();
             let last = match counts.get_mut(&old_ptr) {
-                Some((n, _)) if *n > 1 => {
+                Some((n, ..)) if *n > 1 => {
                     *n -= 1;
                     false
                 }
                 Some(_) => {
                     counts.remove(&old_ptr);
+                    heap.slices_dirty.set(true);
                     true
                 }
                 None => false,
@@ -664,29 +716,151 @@ impl Metal {
         }
     }
 
-    /// Residency without sets: the heap buffer and each distinct allocation its entries name, once
-    /// per encoder (`named` holds the heaps this encoder was given; residency lasts the encoder).
-    /// Naming every entry at every draw cost a `useResource` per entry per draw, and the title fills
-    /// more entries as the world streams in, so frame time grew with play time.
-    fn use_heap_encoder(
+    /// Residency without sets across all active commands of one encoder:
+    /// - Bounded encoders name only `&heap.buf` (`Read`) and the deduplicated allocations of their
+    ///   accessed heap ranges via batched `useResources`, marking read-only resources `Read` and
+    ///   shader-writable resources in UAV ranges `Read | Write`.
+    /// - Unbounded (`all_stages != 0`) encoders submit the heap's cached read-only and writable
+    ///   slices via batched `useResources`, keeping non-`ShaderWrite` textures `Read`.
+    fn use_heaps_encoder<'a>(
         &self,
-        heap: &Heap,
-        named: &mut Vec<*const Heap>,
-        mut use_res: impl FnMut(&ProtocolObject<dyn MTLResource>),
+        cmds: impl Iterator<Item = (&'a Heaps<'a, Metal>, HeapAccess<'a>, u8)>,
+        has_fragment: bool,
+        mut use_batch: impl FnMut(&[RawRes], MTLResourceUsage, u8),
     ) {
-        if heap.set.is_some() || named.contains(&(heap as *const Heap)) {
-            return;
+        struct ResPlan<'a> {
+            heap: &'a Heap,
+            full_stages: u8,
+            full_writes: bool,
+            ranges: Vec<(usize, usize, bool, u8)>,
         }
-        named.push(heap);
-        use_res(ProtocolObject::from_ref(&*heap.buf));
-        let refs = heap.refs.borrow().len() as u64;
-        let allocations = heap.alloc_counts.borrow();
-        allocations.values().for_each(|(_, r)| use_res(r));
-        self.count(|c| {
-            c.heap_resources += 1 + allocations.len() as u64;
-            c.heap_entries = c.heap_entries.max(refs);
-            c.heap_allocations = c.heap_allocations.max(allocations.len() as u64);
-        });
+
+        let mut samplers: Vec<(&'a Heap, u8)> = Vec::new();
+        let mut resources: Vec<ResPlan<'a>> = Vec::new();
+        for (heaps, access, first_bit) in cmds {
+            if let Some(sh) = heaps.sampler
+                && sh.set.is_none()
+            {
+                let st = if has_fragment {
+                    first_bit | STAGE_BIT_FRAGMENT
+                } else {
+                    first_bit
+                };
+                match samplers
+                    .iter_mut()
+                    .find(|(h, _)| std::ptr::eq(*h, sh))
+                {
+                    Some((_, s)) => *s |= st,
+                    None => samplers.push((sh, st)),
+                }
+            }
+            if let Some(rh) = heaps.resource
+                && rh.set.is_none()
+            {
+                let plan = match resources
+                    .iter_mut()
+                    .find(|p| std::ptr::eq(p.heap, rh))
+                {
+                    Some(p) => p,
+                    None => {
+                        resources.push(ResPlan {
+                            heap: rh,
+                            full_stages: 0,
+                            full_writes: false,
+                            ranges: Vec::new(),
+                        });
+                        resources.last_mut().unwrap()
+                    }
+                };
+                if access.all_stages & STAGE_FIRST != 0 {
+                    plan.full_stages |= first_bit;
+                }
+                if has_fragment && access.all_stages & STAGE_FRAGMENT != 0 {
+                    plan.full_stages |= STAGE_BIT_FRAGMENT;
+                }
+                if access.all_stages != 0 {
+                    plan.full_writes |= access.all_writes;
+                }
+                for r in access.ranges {
+                    let start = r.start.min(rh.count);
+                    let end = r.end.min(rh.count);
+                    if start < end {
+                        let st = if has_fragment && r.fragment {
+                            STAGE_BIT_FRAGMENT
+                        } else {
+                            first_bit
+                        };
+                        plan.ranges.push((start, end, r.writes, st));
+                    }
+                }
+            }
+        }
+
+        for (sh, st) in samplers {
+            let buf_ptr = NonNull::from(ProtocolObject::from_ref(&*sh.buf));
+            use_batch(std::slice::from_ref(&buf_ptr), MTLResourceUsage::Read, st);
+            self.count(|c| c.heap_resources += 1);
+        }
+
+        for plan in resources {
+            if plan.full_stages == 0 && plan.ranges.is_empty() {
+                continue;
+            }
+            let rh = plan.heap;
+            let buf_stages = plan
+                .ranges
+                .iter()
+                .fold(plan.full_stages, |acc, r| acc | r.3);
+            let buf_ptr = NonNull::from(ProtocolObject::from_ref(&*rh.buf));
+            let refs_len = rh.refs.borrow().len() as u64;
+            let allocs_len = rh.alloc_counts.borrow().len() as u64;
+
+            if plan.full_stages != 0 {
+                use_batch(
+                    std::slice::from_ref(&buf_ptr),
+                    MTLResourceUsage::Read,
+                    buf_stages,
+                );
+                rh.with_slices(|ro, rw| {
+                    if !ro.is_empty() {
+                        use_batch(ro, MTLResourceUsage::Read, plan.full_stages);
+                    }
+                    if !rw.is_empty() {
+                        let u = if plan.full_writes {
+                            MTLResourceUsage::Read | MTLResourceUsage::Write
+                        } else {
+                            MTLResourceUsage::Read
+                        };
+                        use_batch(rw, u, plan.full_stages);
+                    }
+                });
+                let overrides: Vec<_> = plan
+                    .ranges
+                    .into_iter()
+                    .filter(|r| (r.3 & !plan.full_stages) != 0 || (r.2 && !plan.full_writes))
+                    .collect();
+                if !overrides.is_empty() {
+                    emit_scoped_ranges(rh, overrides, None, &mut use_batch);
+                }
+                self.count(|c| {
+                    c.heap_resources += 1 + allocs_len;
+                    c.heap_entries = c.heap_entries.max(refs_len);
+                    c.heap_allocations = c.heap_allocations.max(allocs_len);
+                });
+            } else {
+                let distinct = emit_scoped_ranges(
+                    rh,
+                    plan.ranges,
+                    Some((buf_ptr, false, buf_stages)),
+                    &mut use_batch,
+                );
+                self.count(|c| {
+                    c.heap_resources += 1 + distinct;
+                    c.heap_entries = c.heap_entries.max(refs_len);
+                    c.heap_allocations = c.heap_allocations.max(allocs_len);
+                });
+            }
+        }
     }
 
     /// The static samplers of one stage's `layout`, if it declares any.
@@ -749,7 +923,6 @@ impl Metal {
         root: &RootArgs,
         heaps: &Heaps<'_, Metal>,
         statics: Option<&StaticSamplers>,
-        named: &mut Vec<*const Heap>,
     ) {
         let root = StaticSamplers::args(statics, &root.0);
         if !root.is_empty() {
@@ -772,9 +945,6 @@ impl Metal {
             if let Some(h) = h {
                 // SAFETY: a live buffer at an in-range slot.
                 unsafe { e.setBuffer_offset_atIndex(Some(&h.buf), 0, slot) };
-                self.use_heap_encoder(h, named, |r| {
-                    e.useResource_usage(r, MTLResourceUsage::Read | MTLResourceUsage::Write)
-                });
             }
         }
     }
@@ -786,7 +956,6 @@ impl Metal {
         fragment: Option<&RootArgs>,
         heaps: &Heaps<'_, Metal>,
         pipeline: &RenderPipeline,
-        named: &mut Vec<*const Heap>,
     ) {
         let fragment = fragment.unwrap_or(root);
         let (vs, ps) = (pipeline.vs_static.as_ref(), pipeline.ps_static.as_ref());
@@ -834,16 +1003,76 @@ impl Metal {
                     }
                     e.setFragmentBuffer_offset_atIndex(Some(&h.buf), 0, slot);
                 }
-                self.use_heap_encoder(h, named, |r| {
-                    e.useResource_usage_stages(
-                        r,
-                        MTLResourceUsage::Read | MTLResourceUsage::Write,
-                        first | MTLRenderStages::Fragment,
-                    )
-                });
             }
         }
     }
+}
+
+fn emit_scoped_ranges(
+    rh: &Heap,
+    mut ranges: Vec<(usize, usize, bool, u8)>,
+    extra_first: Option<(RawRes, bool, u8)>,
+    use_batch: &mut impl FnMut(&[RawRes], MTLResourceUsage, u8),
+) -> u64 {
+    ranges.sort_unstable_by_key(|r| (r.0, r.1));
+    let mut merged: Vec<(usize, usize, bool, u8)> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        if let Some(prev) = merged.last_mut() {
+            if prev.0 == r.0 && prev.1 == r.1 {
+                prev.2 |= r.2;
+                prev.3 |= r.3;
+                continue;
+            }
+            if prev.1 == r.0 && prev.2 == r.2 && prev.3 == r.3 {
+                prev.1 = r.1;
+                continue;
+            }
+        }
+        merged.push(r);
+    }
+    let refs = rh.refs.borrow();
+    let mut items: Vec<(usize, RawRes, bool, u8)> = Vec::new();
+    for &(start, end, writes, st) in &merged {
+        for idx in start..end {
+            if let Some((res, can_write, _)) = refs.get(&idx) {
+                let raw = NonNull::from(ProtocolObject::from_ref(&**res));
+                items.push((raw.as_ptr() as usize, raw, writes && *can_write, st));
+            }
+        }
+    }
+    drop(refs);
+    items.sort_unstable_by_key(|x| x.0);
+    items.dedup_by(|b, a| {
+        if a.0 == b.0 {
+            a.2 |= b.2;
+            a.3 |= b.3;
+            true
+        } else {
+            false
+        }
+    });
+    let distinct = items.len() as u64;
+    if let Some((raw, w, st)) = extra_first {
+        items.push((raw.as_ptr() as usize, raw, w, st));
+    }
+    items.sort_unstable_by_key(|x| (x.2, x.3));
+    let mut batch: Vec<RawRes> = Vec::with_capacity(items.len());
+    let mut i = 0;
+    while i < items.len() {
+        let (_, _, w, st) = items[i];
+        batch.clear();
+        while i < items.len() && items[i].2 == w && items[i].3 == st {
+            batch.push(items[i].1);
+            i += 1;
+        }
+        let usage = if w {
+            MTLResourceUsage::Read | MTLResourceUsage::Write
+        } else {
+            MTLResourceUsage::Read
+        };
+        use_batch(&batch, usage, st);
+    }
+    distinct
 }
 
 impl ResourceBackend for Metal {
@@ -875,6 +1104,8 @@ impl ResourceBackend for Metal {
             refs: RefCell::default(),
             typed_views: Cell::new(0),
             alloc_counts: RefCell::default(),
+            alloc_slices: RefCell::default(),
+            slices_dirty: Cell::new(false),
             requested: set.is_some() && self.request_residency,
             set,
             dirty: Cell::new(false),
@@ -897,7 +1128,7 @@ impl ResourceBackend for Metal {
         let gpu = self.gpu_address(buffer, title);
         let keep: Res = ProtocolObject::from_ref(&*buffer.buf).retain();
         // IRDescriptorTableSetBuffer(entry, gpu, metadata = size & 0xffffffff).
-        self.heap_entry(heap, index, [gpu, 0, size as u64], Some((keep, None)));
+        self.heap_entry(heap, index, [gpu, 0, size as u64], Some((keep, true, None)));
     }
 
     fn write_typed_buffer(
@@ -978,7 +1209,7 @@ impl ResourceBackend for Metal {
             heap,
             index,
             [gpu, tex_id, size as u64],
-            Some((keep_buf, Some(tex))),
+            Some((keep_buf, true, Some(tex))),
         );
         true
     }
@@ -986,9 +1217,15 @@ impl ResourceBackend for Metal {
     fn write_texture(&self, heap: &Heap, index: usize, t: &Texture, min_lod: f32) {
         debug_assert_eq!(heap.kind, HeapKind::Resource);
         let id = resource_id(t.tex.gpuResourceID());
+        let can_write = t.tex.usage().contains(MTLTextureUsage::ShaderWrite);
         let keep: Res = ProtocolObject::from_ref(&*t.tex).retain();
         // IRDescriptorTableSetTexture(entry, tex, minLODClamp, metadata = 0).
-        self.heap_entry(heap, index, [0, id, min_lod.to_bits() as u64], Some((keep, None)));
+        self.heap_entry(
+            heap,
+            index,
+            [0, id, min_lod.to_bits() as u64],
+            Some((keep, can_write, None)),
+        );
     }
 
     fn write_sampler(&self, heap: &Heap, index: usize, s: &Sampler, lod_bias: f32) {
@@ -1011,7 +1248,7 @@ impl ResourceBackend for Metal {
         heap.set.as_ref()?;
         // Each allocation's latest use over the entries naming it.
         let mut latest = std::collections::HashMap::<usize, u32>::new();
-        for (&index, (r, _)) in heap.refs.borrow().iter() {
+        for (&index, (r, ..)) in heap.refs.borrow().iter() {
             let ptr = (&**r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let used = last_used.get(index).copied().unwrap_or(0);
             let e = latest.entry(ptr).or_insert(0);
@@ -1020,7 +1257,7 @@ impl ResourceBackend for Metal {
         // A view's (or a texture over a buffer's) memory is its parent's: count the allocation under
         // it, once, with the latest use over every object made of it.
         let mut under = std::collections::HashMap::<usize, HeapAllocation>::new();
-        for (&id, (_, r)) in heap.alloc_counts.borrow().iter() {
+        for (&id, (.., r)) in heap.alloc_counts.borrow().iter() {
             let used = latest.get(&id).copied().unwrap_or(0);
             let texture = r.respondsToSelector(objc2::sel!(textureType));
             let root: Res = if texture {
@@ -2708,7 +2945,19 @@ impl Metal {
         {
             e.waitForFence(f);
         }
-        let mut named = Vec::new();
+        self.use_heaps_encoder(
+            dispatches
+                .iter()
+                .filter(|d| runs(d))
+                .map(|d| (&d.heaps, d.heap_access, STAGE_BIT_VERTEX)),
+            false,
+            |slice, usage, _| {
+                if let Some(ptr) = NonNull::new(slice.as_ptr().cast_mut()) {
+                    // SAFETY: `slice` holds live non-null `MTLResource` pointers retained by `Heap`.
+                    unsafe { e.useResources_count_usage(ptr, slice.len(), usage) };
+                }
+            },
+        );
         for d in dispatches.iter().filter(|d| runs(d)) {
             // Every indirect record goes through the gate: the count buffer's limit, and the most
             // groups a record may ask for.
@@ -2729,7 +2978,7 @@ impl Metal {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(h, attached_heaps, |set| cb.useResidencySet(set));
             }
-            self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref(), &mut named);
+            self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref());
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage(
                     ProtocolObject::from_ref(&*b.buf),
@@ -3004,7 +3253,45 @@ impl Metal {
         {
             e.waitForFence_beforeStages(f, MTLRenderStages::Vertex | MTLRenderStages::Object | MTLRenderStages::Mesh);
         }
-        let mut named = Vec::new();
+        let active_draw = |d: &Draw<'_, Metal>| -> Option<u8> {
+            let first_bit = match (d.pipeline.mesh, d.call) {
+                (Some(_), DrawCall::Mesh { .. }) => STAGE_BIT_MESH,
+                (None, DrawCall::Arrays { .. } | DrawCall::Indexed { .. } | DrawCall::Rects) => {
+                    STAGE_BIT_VERTEX
+                }
+                _ => return None,
+            };
+            if d.indirect.is_none() && empty_draw(&d.call) {
+                return None;
+            }
+            if matches!(d.state.viewport, Some(v) if v.width <= 0.0 || v.height <= 0.0) {
+                return None;
+            }
+            let (tw, th) = rt_size;
+            if let Some([l, t, r, b]) = d.state.scissor {
+                let (l, t) = (l.clamp(0, tw as i32) as usize, t.clamp(0, th as i32) as usize);
+                let (r, b) = (r.clamp(0, tw as i32) as usize, b.clamp(0, th as i32) as usize);
+                if r <= l || b <= t {
+                    return None;
+                }
+            } else if tw == 0 || th == 0 {
+                return None;
+            }
+            Some(first_bit)
+        };
+        self.use_heaps_encoder(
+            rp.draws
+                .iter()
+                .filter_map(|d| active_draw(d).map(|fb| (&d.heaps, d.heap_access, fb))),
+            true,
+            |slice, usage, stage_bits| {
+                if let Some(ptr) = NonNull::new(slice.as_ptr().cast_mut()) {
+                    let stages = render_stages(stage_bits);
+                    // SAFETY: `slice` holds live non-null `MTLResource` pointers retained by `Heap`.
+                    unsafe { e.useResources_count_usage_stages(ptr, slice.len(), usage, stages) };
+                }
+            },
+        );
         let mut depth_set = false;
         let mut default_depth = None;
         for (k, d) in rp.draws.iter().enumerate() {
@@ -3107,7 +3394,7 @@ impl Metal {
                 continue;
             }
             e.setScissorRect(scissor);
-            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline, &mut named);
+            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
@@ -3439,6 +3726,7 @@ mod render_target_tests {
                 root: RootArgs::default(),
                 fragment_root: None,
                 heaps: Heaps::default(),
+                heap_access: HeapAccess::default(),
                 resources: vec![],
                 vertex_buffers: vec![],
                 index_buffer: None,

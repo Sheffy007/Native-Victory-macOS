@@ -248,8 +248,45 @@ pub struct Binding {
     /// Whether the shader both uses `TypedBuffer` operations and indexes
     /// `ResourceDescriptorHeap` directly (`HostShader::heap`).
     pub heap_typed_buffers: bool,
+    /// Resource-heap entries this stage may dereference when residency sets are off.
+    pub heap_access: StageHeapAccess,
+    /// Pixel stage's resource-heap access when the render pipeline has a pixel shader (kept even
+    /// when `ps` is `None` because the pixel shader had no user-data or root views of its own).
+    pub ps_heap_access: Option<StageHeapAccess>,
     /// The pipeline's name (its shaders' hashes), for diagnostics.
     pub name: Rc<str>,
+}
+
+/// One statically bounded resource-heap access of a translated shader stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageHeapElem {
+    /// Entry `offset` (in 32-byte resource descriptors) past root parameter `slot`'s `Root::Table`.
+    Table { slot: u8, offset: u32, writes: bool },
+    /// Pool-offset contract view pairs `[heap.count .. heap.count + 2 * pairs)`.
+    Pairs { writes: bool },
+    /// Fixed constant heap index `index`.
+    Fixed { index: u32, writes: bool },
+}
+
+/// Resource-heap access summary of a single shader stage (`Binding::of`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageHeapAccess {
+    /// Whether this stage has any unbounded resource-heap read or write.
+    pub unbounded: bool,
+    /// Whether any unbounded resource-heap handle in this stage is an unordered-access view.
+    pub unbounded_writes: bool,
+    /// Deduplicated statically-bounded resource-heap accesses of this stage.
+    pub bounded: Vec<StageHeapElem>,
+}
+
+impl Default for StageHeapAccess {
+    fn default() -> Self {
+        StageHeapAccess {
+            unbounded: true,
+            unbounded_writes: true,
+            bounded: Vec::new(),
+        }
+    }
 }
 
 /// A root view's kind.
@@ -262,7 +299,8 @@ pub enum View {
 
 impl Binding {
     pub fn of(shader: &victory_shader::emit::HostShader) -> Binding {
-        let typed_buffers = dxil_uses_typed_buffers(&shader.dxil);
+        let info = analyze_dxil(&shader.dxil, &shader.user_data);
+        let typed_buffers = info.typed_buffers;
         Binding {
             dwords: shader.user_data_dwords() as usize,
             user_data: shader.user_data.clone(),
@@ -297,6 +335,8 @@ impl Binding {
                 .collect(),
             typed_buffers,
             heap_typed_buffers: typed_buffers && shader.heap,
+            heap_access: info.heap_access,
+            ps_heap_access: None,
             name: "".into(),
         }
     }
@@ -344,13 +384,25 @@ impl Binding {
     }
 }
 
-/// Whether a DXBC-wrapped DXIL module emitted by `victory-shader` calls `dx.op.bufferLoad.*`,
-/// `dx.op.bufferStore.*`, or `dx.op.getDimensions` on a `TypedBuffer` (`ResourceProperties` kind
-/// `10`). Defaults conservatively to `true` on unrecognized or abbreviated bitcode.
-fn dxil_uses_typed_buffers(dxil: &[u8]) -> bool {
+struct DxilInfo {
+    typed_buffers: bool,
+    heap_access: StageHeapAccess,
+}
+
+/// Inspects a DXBC-wrapped DXIL module emitted by `victory-shader` for:
+/// 1. `TypedBuffer` operations (`dx.op.bufferLoad.*`, `dx.op.bufferStore.*`, or `dx.op.getDimensions`
+///    on `ResourceProperties` kind `10`), and
+/// 2. Every resource `dx.op.createHandleFromHeap` / `dx.op.annotateHandle` call, proving which heap
+///    entries are statically bounded (`Table`, `Pairs`, `Fixed`) vs unbounded (`unbounded`).
+///
+/// Defaults conservatively on unrecognized or abbreviated bitcode.
+fn analyze_dxil(dxil: &[u8], user_data: &[victory_shader::emit::UserData]) -> DxilInfo {
     dxil_bitcode(dxil)
-        .and_then(scan_dxil_typed_buffers)
-        .unwrap_or(true)
+        .and_then(|bc| scan_dxil_info(bc, user_data))
+        .unwrap_or(DxilInfo {
+            typed_buffers: true,
+            heap_access: StageHeapAccess::default(),
+        })
 }
 
 fn dxil_bitcode(dxil: &[u8]) -> Option<&[u8]> {
@@ -381,7 +433,61 @@ fn dxil_bitcode(dxil: &[u8]) -> Option<&[u8]> {
     None
 }
 
-fn scan_dxil_typed_buffers(bc: &[u8]) -> Option<bool> {
+fn decode_signed(raw: u64) -> i64 {
+    if raw & 1 == 0 {
+        (raw >> 1) as i64
+    } else {
+        -((raw >> 1) as i64)
+    }
+}
+
+fn dedup_stage_elems(elems: &mut Vec<StageHeapElem>) {
+    let key = |e: &StageHeapElem| match *e {
+        StageHeapElem::Table { slot, offset, writes } => (0u8, slot, offset, !writes),
+        StageHeapElem::Pairs { writes } => (1, 0, 0, !writes),
+        StageHeapElem::Fixed { index, writes } => (2, 0, index, !writes),
+    };
+    elems.sort_unstable_by_key(key);
+    elems.dedup_by(|b, a| {
+        let ka = key(a);
+        let kb = key(b);
+        (ka.0, ka.1, ka.2) == (kb.0, kb.1, kb.2)
+    });
+}
+
+fn scan_dxil_info(
+    bc: &[u8],
+    user_data: &[victory_shader::emit::UserData],
+) -> Option<DxilInfo> {
+    use victory_shader::RootType;
+    use victory_shader::emit::{
+        HEAP_VIEWS, MEMORY_SPACE, ROOT_SRV_VIEW, ROOT_UAV_VIEW, USER_DATA_SPACE,
+    };
+
+    #[derive(Clone, Copy)]
+    enum PendingStruct {
+        None,
+        Props,
+        Bind,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Node {
+        Other,
+        UserCbv,
+        MemoryTable,
+        UserRow(u32),
+        UserDword(u32),
+        MemLoadVec,
+        MemLoadF32,
+        PairIndex,
+        Add(u32, u32),
+        Sub(u32, u32),
+        LShr(u32, u32),
+        Select(u32, u32),
+        Phi(u32, u16),
+    }
+
     struct BitReader<'a> {
         words: &'a [u8],
         bit: usize,
@@ -441,22 +547,48 @@ fn scan_dxil_typed_buffers(bc: &[u8]) -> Option<bool> {
         return None;
     }
 
+    let mut void_ty: Option<u64> = None;
     let mut props_ty: Option<u64> = None;
+    let mut bind_ty: Option<u64> = None;
+    let mut func_types: Vec<Option<(bool, u32)>> = Vec::new();
+    let mut defined_func_tys: Vec<u64> = Vec::new();
+    let mut func_idx = 0usize;
     let mut value_base = 0u64;
+    let mut const_int: Vec<Option<u32>> = Vec::new();
+    let mut res_props: Vec<Option<u32>> = Vec::new();
+    let mut res_bind: Vec<Option<(u32, u32, u8)>> = Vec::new();
     let mut has_typed_props = false;
+    let mut has_buf_load_store = false;
     let mut has_get_dims = false;
+    let mut seen_symtab = false;
+    let mut fn_create_from_binding: Option<u64> = None;
+    let mut fn_create_from_heap: Option<u64> = None;
+    let mut fn_annotate: Option<u64> = None;
+    let mut fn_cbuf_load_i32: Option<u64> = None;
+    let mut fn_raw_buf_load_f32: Option<u64> = None;
+    let mut stage_unbounded = false;
+    let mut stage_unbounded_writes = false;
+    let mut stage_bounded: Vec<StageHeapElem> = Vec::new();
     let mut scratch = Vec::new();
+    let mut ops = Vec::new();
+
     while r.bit < mod_end {
         match r.bits(mod_w, mod_end)? {
             0 => break,
             3 => {
                 let code = r.vbr(6, mod_end)?;
                 let n = r.vbr(6, mod_end)? as usize;
+                ops.clear();
                 for _ in 0..n {
-                    r.vbr(6, mod_end)?;
+                    ops.push(r.vbr(6, mod_end)?);
                 }
-                if code == 7 || code == 8 {
+                if code == 7 {
                     value_base += 1;
+                } else if code == 8 {
+                    value_base += 1;
+                    if ops.len() >= 3 && ops[2] == 0 {
+                        defined_func_tys.push(ops[0]);
+                    }
                 }
             }
             1 => {
@@ -469,9 +601,9 @@ fn scan_dxil_typed_buffers(bc: &[u8]) -> Option<bool> {
                     return None;
                 }
                 match sub_id {
-                    // TYPE_BLOCK: locate `dx.types.ResourceProperties`.
+                    // TYPE_BLOCK: locate `void`, `ResourceProperties`, `ResBind`, and function types.
                     17 => {
-                        let (mut ty_idx, mut is_props_name) = (0u64, false);
+                        let (mut ty_idx, mut pending) = (0u64, PendingStruct::None);
                         while r.bit < sub_end {
                             match r.bits(sub_w, sub_end)? {
                                 0 => break,
@@ -483,16 +615,36 @@ fn scan_dxil_typed_buffers(bc: &[u8]) -> Option<bool> {
                                         for _ in 0..n {
                                             scratch.push(r.vbr(6, sub_end)? as u8);
                                         }
-                                        is_props_name = scratch == b"dx.types.ResourceProperties";
+                                        pending = if scratch == b"dx.types.ResourceProperties" {
+                                            PendingStruct::Props
+                                        } else if scratch == b"dx.types.ResBind" {
+                                            PendingStruct::Bind
+                                        } else {
+                                            PendingStruct::None
+                                        };
                                     } else {
+                                        ops.clear();
                                         for _ in 0..n {
-                                            r.vbr(6, sub_end)?;
+                                            ops.push(r.vbr(6, sub_end)?);
                                         }
                                         if code != 1 {
-                                            if code == 20 && is_props_name {
-                                                props_ty = Some(ty_idx);
-                                            }
-                                            is_props_name = false;
+                                            let fty = if code == 2 {
+                                                void_ty = Some(ty_idx);
+                                                None
+                                            } else if code == 20 {
+                                                match pending {
+                                                    PendingStruct::Props => props_ty = Some(ty_idx),
+                                                    PendingStruct::Bind => bind_ty = Some(ty_idx),
+                                                    PendingStruct::None => {}
+                                                }
+                                                None
+                                            } else if code == 21 && ops.len() >= 2 {
+                                                Some((Some(ops[1]) == void_ty, (ops.len() - 2) as u32))
+                                            } else {
+                                                None
+                                            };
+                                            func_types.push(fty);
+                                            pending = PendingStruct::None;
                                             ty_idx += 1;
                                         }
                                     }
@@ -502,53 +654,58 @@ fn scan_dxil_typed_buffers(bc: &[u8]) -> Option<bool> {
                         }
                         r.bit = sub_end;
                     }
-                    // CONSTANTS_BLOCK: check for `ResourceProperties` with resource kind 10 (`TypedBuffer`).
+                    // CONSTANTS_BLOCK: record integer constants, `ResourceProperties`, and `ResBind`.
                     11 => {
                         let mut cur_ty = None;
-                        let mut int_low: Vec<Option<u8>> = Vec::new();
                         while r.bit < sub_end {
                             match r.bits(sub_w, sub_end)? {
                                 0 => break,
                                 3 => {
                                     let code = r.vbr(6, sub_end)?;
                                     let n = r.vbr(6, sub_end)? as usize;
-                                    if code == 1 && n >= 1 {
-                                        cur_ty = Some(r.vbr(6, sub_end)?);
-                                        for _ in 1..n {
-                                            r.vbr(6, sub_end)?;
-                                        }
-                                    } else if code == 4 && n >= 1 {
-                                        let raw = r.vbr(6, sub_end)?;
-                                        for _ in 1..n {
-                                            r.vbr(6, sub_end)?;
-                                        }
-                                        let val = if raw & 1 == 0 {
-                                            (raw >> 1) as i64
-                                        } else {
-                                            -((raw >> 1) as i64)
+                                    ops.clear();
+                                    for _ in 0..n {
+                                        ops.push(r.vbr(6, sub_end)?);
+                                    }
+                                    if code == 1 && !ops.is_empty() {
+                                        cur_ty = Some(ops[0]);
+                                    } else if code == 2 {
+                                        const_int.push(Some(0));
+                                        res_props.push((cur_ty == props_ty && props_ty.is_some()).then_some(0));
+                                        res_bind.push((cur_ty == bind_ty && bind_ty.is_some()).then_some((0, 0, 0)));
+                                    } else if code == 4 && !ops.is_empty() {
+                                        let val = decode_signed(ops[0]) as u32;
+                                        const_int.push(Some(val));
+                                        res_props.push(None);
+                                        res_bind.push(None);
+                                    } else if code == 7 {
+                                        let int_at = |id: u64, ci: &[Option<u32>]| {
+                                            id.checked_sub(value_base)
+                                                .and_then(|k| ci.get(k as usize).copied().flatten())
                                         };
-                                        int_low.push(Some((val as u64 & 0xFF) as u8));
-                                    } else if code == 7
-                                        && cur_ty == props_ty
-                                        && props_ty.is_some()
-                                        && n >= 1
-                                    {
-                                        let id0 = r.vbr(6, sub_end)?;
-                                        for _ in 1..n {
-                                            r.vbr(6, sub_end)?;
-                                        }
-                                        if let Some(idx) = id0.checked_sub(value_base)
-                                            && int_low.get(idx as usize).copied().flatten()
-                                                == Some(10)
-                                        {
+                                        let p = if cur_ty == props_ty && props_ty.is_some() && !ops.is_empty() {
+                                            int_at(ops[0], &const_int)
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(p0) = p && (p0 & 0xFF) == 10 {
                                             has_typed_props = true;
                                         }
-                                        int_low.push(None);
+                                        let b = if cur_ty == bind_ty && bind_ty.is_some() && ops.len() >= 4 {
+                                            match (int_at(ops[0], &const_int), int_at(ops[2], &const_int), int_at(ops[3], &const_int)) {
+                                                (Some(lo), Some(sp), Some(cl)) => Some((lo, sp, cl as u8)),
+                                                _ => None,
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                        const_int.push(None);
+                                        res_props.push(p);
+                                        res_bind.push(b);
                                     } else {
-                                        for _ in 0..n {
-                                            r.vbr(6, sub_end)?;
-                                        }
-                                        int_low.push(None);
+                                        const_int.push(None);
+                                        res_props.push(None);
+                                        res_bind.push(None);
                                     }
                                 }
                                 _ => return None,
@@ -558,6 +715,7 @@ fn scan_dxil_typed_buffers(bc: &[u8]) -> Option<bool> {
                     }
                     // VALUE_SYMTAB_BLOCK: inspect kept `dx.op.*` declarations.
                     14 => {
+                        seen_symtab = true;
                         while r.bit < sub_end {
                             match r.bits(sub_w, sub_end)? {
                                 0 => break,
@@ -565,7 +723,7 @@ fn scan_dxil_typed_buffers(bc: &[u8]) -> Option<bool> {
                                     let code = r.vbr(6, sub_end)?;
                                     let n = r.vbr(6, sub_end)? as usize;
                                     if code == 1 && n >= 1 {
-                                        let _val_id = r.vbr(6, sub_end)?;
+                                        let val_id = r.vbr(6, sub_end)?;
                                         scratch.clear();
                                         for _ in 1..n {
                                             scratch.push(r.vbr(6, sub_end)? as u8);
@@ -573,10 +731,19 @@ fn scan_dxil_typed_buffers(bc: &[u8]) -> Option<bool> {
                                         if scratch.starts_with(b"dx.op.bufferLoad.")
                                             || scratch.starts_with(b"dx.op.bufferStore.")
                                         {
-                                            return Some(true);
-                                        }
-                                        if scratch == b"dx.op.getDimensions" {
+                                            has_buf_load_store = true;
+                                        } else if scratch == b"dx.op.getDimensions" {
                                             has_get_dims = true;
+                                        } else if scratch == b"dx.op.createHandleFromBinding" {
+                                            fn_create_from_binding = Some(val_id);
+                                        } else if scratch == b"dx.op.createHandleFromHeap" {
+                                            fn_create_from_heap = Some(val_id);
+                                        } else if scratch == b"dx.op.annotateHandle" {
+                                            fn_annotate = Some(val_id);
+                                        } else if scratch == b"dx.op.cbufferLoadLegacy.i32" {
+                                            fn_cbuf_load_i32 = Some(val_id);
+                                        } else if scratch == b"dx.op.rawBufferLoad.f32" {
+                                            fn_raw_buf_load_f32 = Some(val_id);
                                         }
                                     } else {
                                         for _ in 0..n {
@@ -589,13 +756,443 @@ fn scan_dxil_typed_buffers(bc: &[u8]) -> Option<bool> {
                         }
                         r.bit = sub_end;
                     }
+                    // FUNCTION_BLOCK: trace every resource `createHandleFromHeap` index expression.
+                    12 => {
+                        if !seen_symtab {
+                            return None;
+                        }
+                        let fty = *defined_func_tys.get(func_idx)?;
+                        func_idx += 1;
+                        if fn_create_from_heap.is_none() {
+                            r.bit = sub_end;
+                            continue;
+                        }
+                        let (_, n_params) = (*func_types.get(fty as usize)?)?;
+                        let inst_base = value_base
+                            .checked_add(const_int.len() as u64)?
+                            .checked_add(u64::from(n_params))?;
+                        let mut inst_id = inst_base;
+                        let mut nodes: Vec<Node> = Vec::new();
+                        let mut phi_args: Vec<u32> = Vec::new();
+                        // `(handle_val_id, raw_index_val_id, annotated, writes)`
+                        let mut heap_handles: Vec<(u32, u32, bool, bool)> = Vec::new();
+
+                        let const_raw = |id: u64| -> Option<u32> {
+                            id.checked_sub(value_base)
+                                .and_then(|k| const_int.get(k as usize).copied().flatten())
+                        };
+                        let props_raw = |id: u64| -> Option<u32> {
+                            id.checked_sub(value_base)
+                                .and_then(|k| res_props.get(k as usize).copied().flatten())
+                        };
+                        let bind_raw = |id: u64| -> Option<(u32, u32, u8)> {
+                            id.checked_sub(value_base)
+                                .and_then(|k| res_bind.get(k as usize).copied().flatten())
+                        };
+
+                        while r.bit < sub_end {
+                            match r.bits(sub_w, sub_end)? {
+                                0 => break,
+                                3 => {
+                                    let code = r.vbr(6, sub_end)?;
+                                    let n = r.vbr(6, sub_end)? as usize;
+                                    ops.clear();
+                                    for _ in 0..n {
+                                        ops.push(r.vbr(6, sub_end)?);
+                                    }
+                                    let node_at = |id: u32, nodes: &[Node]| -> Option<Node> {
+                                        u64::from(id)
+                                            .checked_sub(inst_base)
+                                            .and_then(|k| nodes.get(k as usize).copied())
+                                    };
+                                    match code {
+                                        1 | 10 | 11 | 44 => {}
+                                        2 => {
+                                            if ops.len() < 3 {
+                                                return None;
+                                            }
+                                            let a = u32::try_from(inst_id.checked_sub(ops[0])?).ok()?;
+                                            let b = u32::try_from(inst_id.checked_sub(ops[1])?).ok()?;
+                                            let node = match ops[2] {
+                                                0 => Node::Add(a, b),
+                                                1 => Node::Sub(a, b),
+                                                8 => Node::LShr(a, b),
+                                                _ => Node::Other,
+                                            };
+                                            nodes.push(node);
+                                            inst_id += 1;
+                                        }
+                                        3 => {
+                                            if ops.is_empty() {
+                                                return None;
+                                            }
+                                            let v = u32::try_from(inst_id.checked_sub(ops[0])?).ok()?;
+                                            let node = if matches!(node_at(v, &nodes), Some(Node::MemLoadF32)) {
+                                                Node::PairIndex
+                                            } else {
+                                                Node::Other
+                                            };
+                                            nodes.push(node);
+                                            inst_id += 1;
+                                        }
+                                        26 => {
+                                            if ops.len() < 2 {
+                                                return None;
+                                            }
+                                            let agg = u32::try_from(inst_id.checked_sub(ops[0])?).ok()?;
+                                            let idx = ops[1];
+                                            let node = match node_at(agg, &nodes) {
+                                                Some(Node::UserRow(row)) if idx < 4 => {
+                                                    Node::UserDword(row * 4 + idx as u32)
+                                                }
+                                                Some(Node::MemLoadVec) if idx == 0 => Node::MemLoadF32,
+                                                _ => Node::Other,
+                                            };
+                                            nodes.push(node);
+                                            inst_id += 1;
+                                        }
+                                        29 => {
+                                            if ops.len() < 3 {
+                                                return None;
+                                            }
+                                            let t = u32::try_from(inst_id.checked_sub(ops[0])?).ok()?;
+                                            let f = u32::try_from(inst_id.checked_sub(ops[1])?).ok()?;
+                                            nodes.push(Node::Select(t, f));
+                                            inst_id += 1;
+                                        }
+                                        16 => {
+                                            if ops.is_empty() || !(ops.len() - 1).is_multiple_of(2) {
+                                                return None;
+                                            }
+                                            let pairs = (ops.len() - 1) / 2;
+                                            let start = u32::try_from(phi_args.len()).ok()?;
+                                            let len = u16::try_from(pairs).ok()?;
+                                            for k in 0..pairs {
+                                                let srel = decode_signed(ops[1 + 2 * k]);
+                                                let target = i64::try_from(inst_id).ok()?.checked_sub(srel)?;
+                                                phi_args.push(u32::try_from(target).ok()?);
+                                            }
+                                            nodes.push(Node::Phi(start, len));
+                                            inst_id += 1;
+                                        }
+                                        20 | 28 | 38 | 43 | 46 => {
+                                            nodes.push(Node::Other);
+                                            inst_id += 1;
+                                        }
+                                        34 => {
+                                            if ops.len() < 4 || ops[1] & (1 << 15) == 0 {
+                                                return None;
+                                            }
+                                            let (is_void, _) = (*func_types.get(ops[2] as usize)?)?;
+                                            let callee = inst_id.checked_sub(ops[3])?;
+                                            if is_void {
+                                                continue;
+                                            }
+                                            let arg = |k: usize| -> Option<u64> {
+                                                inst_id.checked_sub(*ops.get(4 + k)?)
+                                            };
+                                            let node = if Some(callee) == fn_create_from_binding && ops.len() == 8 {
+                                                match bind_raw(arg(1)?) {
+                                                    Some((0, USER_DATA_SPACE, 2)) => Node::UserCbv,
+                                                    Some((0, MEMORY_SPACE, 0)) => Node::MemoryTable,
+                                                    _ => Node::Other,
+                                                }
+                                            } else if Some(callee) == fn_annotate && ops.len() == 7 {
+                                                let h_val = u32::try_from(arg(1)?).ok()?;
+                                                let p_val = arg(2)?;
+                                                let is_uav = props_raw(p_val).is_none_or(|p| p & 0x1000 != 0);
+                                                for hh in &mut heap_handles {
+                                                    if hh.0 == h_val {
+                                                        hh.2 = true;
+                                                        hh.3 |= is_uav;
+                                                    }
+                                                }
+                                                match node_at(h_val, &nodes) {
+                                                    Some(Node::UserCbv) => Node::UserCbv,
+                                                    Some(Node::MemoryTable) => Node::MemoryTable,
+                                                    _ => Node::Other,
+                                                }
+                                            } else if Some(callee) == fn_cbuf_load_i32 && ops.len() == 7 {
+                                                let cbv_h = u32::try_from(arg(1)?).ok()?;
+                                                match (node_at(cbv_h, &nodes), const_raw(arg(2)?)) {
+                                                    (Some(Node::UserCbv), Some(row)) => Node::UserRow(row),
+                                                    _ => Node::Other,
+                                                }
+                                            } else if Some(callee) == fn_raw_buf_load_f32 && ops.len() == 10 {
+                                                let srv_h = u32::try_from(arg(1)?).ok()?;
+                                                if matches!(node_at(srv_h, &nodes), Some(Node::MemoryTable)) {
+                                                    Node::MemLoadVec
+                                                } else {
+                                                    Node::Other
+                                                }
+                                            } else if Some(callee) == fn_create_from_heap && ops.len() == 8 {
+                                                let idx_val = u32::try_from(arg(1)?).ok()?;
+                                                match const_raw(arg(2)?) {
+                                                    Some(1) => {}
+                                                    Some(0) => {
+                                                        let h_id = u32::try_from(inst_id).ok()?;
+                                                        heap_handles.push((h_id, idx_val, false, false));
+                                                    }
+                                                    _ => {
+                                                        let h_id = u32::try_from(inst_id).ok()?;
+                                                        heap_handles.push((h_id, idx_val, true, true));
+                                                    }
+                                                }
+                                                Node::Other
+                                            } else {
+                                                Node::Other
+                                            };
+                                            nodes.push(node);
+                                            inst_id += 1;
+                                        }
+                                        _ => return None,
+                                    }
+                                }
+                                _ => return None,
+                            }
+                        }
+                        r.bit = sub_end;
+
+                        let node_of = |id: u32| -> Option<Node> {
+                            u64::from(id)
+                                .checked_sub(inst_base)
+                                .and_then(|k| nodes.get(k as usize).copied())
+                        };
+                        fn eval_const(
+                            v: u32,
+                            depth: u8,
+                            value_base: u64,
+                            const_int: &[Option<u32>],
+                            inst_base: u64,
+                            nodes: &[Node],
+                        ) -> Option<u32> {
+                            if depth > 16 {
+                                return None;
+                            }
+                            if let Some(c) = u64::from(v)
+                                .checked_sub(value_base)
+                                .and_then(|k| const_int.get(k as usize).copied().flatten())
+                            {
+                                return Some(c);
+                            }
+                            let n = u64::from(v)
+                                .checked_sub(inst_base)
+                                .and_then(|k| nodes.get(k as usize).copied())?;
+                            match n {
+                                Node::Add(a, b) => Some(
+                                    eval_const(a, depth + 1, value_base, const_int, inst_base, nodes)?
+                                        .wrapping_add(eval_const(b, depth + 1, value_base, const_int, inst_base, nodes)?),
+                                ),
+                                Node::Sub(a, b) => Some(
+                                    eval_const(a, depth + 1, value_base, const_int, inst_base, nodes)?
+                                        .wrapping_sub(eval_const(b, depth + 1, value_base, const_int, inst_base, nodes)?),
+                                ),
+                                Node::LShr(a, b) => {
+                                    let s = eval_const(b, depth + 1, value_base, const_int, inst_base, nodes)?;
+                                    (s < 32).then(|| {
+                                        eval_const(a, depth + 1, value_base, const_int, inst_base, nodes)
+                                            .map(|x| x >> s)
+                                    })?
+                                }
+                                _ => None,
+                            }
+                        }
+                        fn eval_table_bytes(
+                            v: u32,
+                            depth: u8,
+                            user_data: &[victory_shader::emit::UserData],
+                            value_base: u64,
+                            const_int: &[Option<u32>],
+                            inst_base: u64,
+                            nodes: &[Node],
+                        ) -> Option<(u8, u32)> {
+                            if depth > 16 {
+                                return None;
+                            }
+                            let n = u64::from(v)
+                                .checked_sub(inst_base)
+                                .and_then(|k| nodes.get(k as usize).copied())?;
+                            match n {
+                                Node::UserDword(ud_idx) => user_data
+                                    .iter()
+                                    .find(|u| u.index == ud_idx && u.root == RootType::Table && u.dword == 0)
+                                    .map(|u| (u.slot, 0)),
+                                Node::Add(a, b) => {
+                                    if let (Some((slot, off)), Some(k)) = (
+                                        eval_table_bytes(a, depth + 1, user_data, value_base, const_int, inst_base, nodes),
+                                        eval_const(b, depth + 1, value_base, const_int, inst_base, nodes),
+                                    ) {
+                                        Some((slot, off.wrapping_add(k)))
+                                    } else if let (Some(k), Some((slot, off))) = (
+                                        eval_const(a, depth + 1, value_base, const_int, inst_base, nodes),
+                                        eval_table_bytes(b, depth + 1, user_data, value_base, const_int, inst_base, nodes),
+                                    ) {
+                                        Some((slot, off.wrapping_add(k)))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Node::Sub(a, b) => {
+                                    let (slot, off) = eval_table_bytes(
+                                        a, depth + 1, user_data, value_base, const_int, inst_base, nodes,
+                                    )?;
+                                    let k = eval_const(b, depth + 1, value_base, const_int, inst_base, nodes)?;
+                                    Some((slot, off.wrapping_sub(k)))
+                                }
+                                _ => None,
+                            }
+                        }
+                        #[allow(clippy::too_many_arguments)]
+                        fn resolve_index(
+                            v: u32,
+                            writes: bool,
+                            user_data: &[victory_shader::emit::UserData],
+                            value_base: u64,
+                            const_int: &[Option<u32>],
+                            inst_base: u64,
+                            nodes: &[Node],
+                            phi_args: &[u32],
+                            visiting: &mut Vec<u32>,
+                            seen: &mut Vec<u32>,
+                            out: &mut Vec<StageHeapElem>,
+                        ) -> bool {
+                            if seen.contains(&v) {
+                                return true;
+                            }
+                            if out.len() > 128 {
+                                return false;
+                            }
+                            if let Some(c) = eval_const(v, 0, value_base, const_int, inst_base, nodes) {
+                                out.push(StageHeapElem::Fixed { index: c, writes });
+                                seen.push(v);
+                                return true;
+                            }
+                            let Some(n) = u64::from(v)
+                                .checked_sub(inst_base)
+                                .and_then(|k| nodes.get(k as usize).copied())
+                            else {
+                                return false;
+                            };
+                            let ok = match n {
+                                Node::PairIndex => {
+                                    out.push(StageHeapElem::Pairs { writes });
+                                    true
+                                }
+                                Node::Add(a, b) => {
+                                    let node_a = u64::from(a).checked_sub(inst_base).and_then(|k| nodes.get(k as usize).copied());
+                                    let node_b = u64::from(b).checked_sub(inst_base).and_then(|k| nodes.get(k as usize).copied());
+                                    let is_pair_plus_one = (matches!(node_a, Some(Node::PairIndex))
+                                        && eval_const(b, 0, value_base, const_int, inst_base, nodes) == Some(1))
+                                        || (eval_const(a, 0, value_base, const_int, inst_base, nodes) == Some(1)
+                                            && matches!(node_b, Some(Node::PairIndex)));
+                                    if is_pair_plus_one {
+                                        out.push(StageHeapElem::Pairs { writes });
+                                    }
+                                    is_pair_plus_one
+                                }
+                                Node::UserDword(ud_idx) => {
+                                    let is_root_pair = user_data.iter().any(|u| {
+                                        u.index == ud_idx
+                                            && u.root == RootType::Descriptor
+                                            && matches!(u.dword, ROOT_SRV_VIEW | ROOT_UAV_VIEW)
+                                    });
+                                    if is_root_pair {
+                                        out.push(StageHeapElem::Pairs { writes });
+                                    }
+                                    is_root_pair
+                                }
+                                Node::LShr(addr, shift)
+                                    if eval_const(shift, 0, value_base, const_int, inst_base, nodes) == Some(5) =>
+                                {
+                                    if let Some((slot, byte_off)) = eval_table_bytes(
+                                        addr, 0, user_data, value_base, const_int, inst_base, nodes,
+                                    ) && (byte_off as i32) >= 0
+                                    {
+                                        out.push(StageHeapElem::Table {
+                                            slot,
+                                            offset: byte_off >> 5,
+                                            writes,
+                                        });
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                Node::Select(t, f) => {
+                                    resolve_index(t, writes, user_data, value_base, const_int, inst_base, nodes, phi_args, visiting, seen, out)
+                                        && resolve_index(f, writes, user_data, value_base, const_int, inst_base, nodes, phi_args, visiting, seen, out)
+                                }
+                                Node::Phi(start, len) => {
+                                    if len == 0 || visiting.contains(&v) {
+                                        return false;
+                                    }
+                                    visiting.push(v);
+                                    let args = &phi_args[start as usize..start as usize + usize::from(len)];
+                                    let all_ok = args.iter().all(|&arg| {
+                                        resolve_index(arg, writes, user_data, value_base, const_int, inst_base, nodes, phi_args, visiting, seen, out)
+                                    });
+                                    visiting.pop();
+                                    all_ok
+                                }
+                                _ => false,
+                            };
+                            if ok {
+                                seen.push(v);
+                            }
+                            ok
+                        }
+
+                        let mut visiting = Vec::new();
+                        let mut seen = Vec::new();
+                        let mut local = Vec::new();
+                        for &(_h_id, mut idx_id, annotated, mut writes) in &heap_handles {
+                            if !annotated {
+                                writes = true;
+                            }
+                            if let Some(Node::Select(t, f)) = node_of(idx_id)
+                                && eval_const(t, 0, value_base, &const_int, inst_base, &nodes)
+                                    == Some(HEAP_VIEWS - 1)
+                            {
+                                idx_id = f;
+                            }
+                            visiting.clear();
+                            seen.clear();
+                            local.clear();
+                            if resolve_index(
+                                idx_id,
+                                writes,
+                                user_data,
+                                value_base,
+                                &const_int,
+                                inst_base,
+                                &nodes,
+                                &phi_args,
+                                &mut visiting,
+                                &mut seen,
+                                &mut local,
+                            ) {
+                                stage_bounded.extend_from_slice(&local);
+                            } else {
+                                stage_unbounded = true;
+                                stage_unbounded_writes |= writes;
+                            }
+                        }
+                    }
                     _ => r.bit = sub_end,
                 }
             }
             _ => return None,
         }
     }
-    Some(has_get_dims && has_typed_props)
+    dedup_stage_elems(&mut stage_bounded);
+    Some(DxilInfo {
+        typed_buffers: has_buf_load_store || (has_get_dims && has_typed_props),
+        heap_access: StageHeapAccess {
+            unbounded: stage_unbounded,
+            unbounded_writes: stage_unbounded_writes,
+            bounded: stage_bounded,
+        },
+    })
 }
 
 /// A compute pipeline and the group size its shader was written with (`numthreads`).

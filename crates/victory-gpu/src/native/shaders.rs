@@ -358,6 +358,7 @@ impl<B: PresentBackend> Title<B> {
         if let Some(p) = &ps_full {
             vs_binding.typed_buffers |= p.typed_buffers;
             vs_binding.heap_typed_buffers |= p.heap_typed_buffers;
+            vs_binding.ps_heap_access = Some(p.heap_access.clone());
         }
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its

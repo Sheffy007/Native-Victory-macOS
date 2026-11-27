@@ -415,7 +415,12 @@ command buffer and the GPU starting it; with the sets, 0. The 35 drawing passes 
 main submission were 5.4 s. With the same build and only the switch changed, world frames went from
 0.07 fps (15 frames in 218 s) to 0.47 fps (101 frames in 213 s; 0.6 once the world's pipelines are
 made) on an M5 Pro with 48 GB, and the process's footprint at the first world frame was 16 GB either
-way.
+way. Per-encoder residency now scopes each pass from the DXIL `createHandleFromHeap` / `annotateHandle`
+calls of its pipelines (`Binding::heap_access`, `HeapAccess`): passes whose shaders never touch the
+resource heap name 0 heap allocations, passes with only bounded table/fixed/pool-pair accesses name
+only those entries, and genuinely bindless passes submit cached contiguous slices with batch
+`useResources:count:usage:` (`Read` for non-`ShaderWrite` textures, `Read | Write` only where UAVs are
+written).
 
 `VICTORY_METAL_RESIDENCY_SETS=1` also puts the title's pool buffers in one set on every queue (below).
 That keeps all of title memory (about 6.7 GB on a Series S profile) resident for the whole process:

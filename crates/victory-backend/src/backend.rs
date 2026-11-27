@@ -51,6 +51,45 @@ pub struct RootLayout {
     pub static_samplers: Vec<[u32; 10]>,
 }
 
+/// Stage bit in [`HeapAccess::all_stages`] for compute, vertex, or mesh shaders.
+pub const STAGE_FIRST: u8 = 1;
+/// Stage bit in [`HeapAccess::all_stages`] for fragment shaders.
+pub const STAGE_FRAGMENT: u8 = 2;
+
+/// A contiguous `[start, end)` range of entries in `Heaps::resource` that a translated shader stage
+/// may dereference (`writes`: through an unordered-access view; `fragment`: fragment stage on a
+/// render pass, ignored on compute).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapRange {
+    pub start: usize,
+    pub end: usize,
+    pub writes: bool,
+    pub fragment: bool,
+}
+
+/// Which entries of `Heaps::resource` a draw or dispatch may reach when residency sets are off.
+#[derive(Clone, Copy, Debug)]
+pub struct HeapAccess<'a> {
+    /// Stage mask (`STAGE_FIRST`, `STAGE_FRAGMENT`) of stages that index `Heaps::resource` without
+    /// a static bound (bindless `ResourceDescriptorHeap`, dynamic table offset, or untranslated
+    /// DXIL); `0` when every stage is bounded by `ranges`.
+    pub all_stages: u8,
+    /// Whether any stage in `all_stages` may write through an unbounded unordered-access view.
+    pub all_writes: bool,
+    /// Statically bounded entry ranges accessed by the command's stages.
+    pub ranges: &'a [HeapRange],
+}
+
+impl Default for HeapAccess<'_> {
+    fn default() -> Self {
+        HeapAccess {
+            all_stages: STAGE_FIRST | STAGE_FRAGMENT,
+            all_writes: true,
+            ranges: &[],
+        }
+    }
+}
+
 /// One `Dispatch` call: the pipeline, its root arguments, the memory it touches (for residency),
 /// and the group counts and sizes.
 pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
@@ -60,6 +99,7 @@ pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
     /// resident by the heaps themselves).
     pub resources: Vec<&'a B::Buffer>,
     pub heaps: Heaps<'a, B>,
+    pub heap_access: HeapAccess<'a>,
     pub groups: [usize; 3],
     pub threads_per_group: [usize; 3],
     /// `ExecuteIndirect`: the group counts are read on the GPU from this title address (three
