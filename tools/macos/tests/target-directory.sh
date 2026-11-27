@@ -123,6 +123,7 @@ test_environment() {
   configure "$repo/.cargo" 'project decoy'
   export CARGO_TARGET_DIR="$shared" CHILD_STATUS=37
   launch "$shared" --headless
+  grep -Fxq '# victory exit status 37' "$repo"/runs/*/victory.log || fail "log lost child exit status"
 }
 test_build_environment() { export CARGO_BUILD_TARGET_DIR="$shared"; launch "$shared"; }
 test_relative_environment() { export CARGO_TARGET_DIR='relative target'; launch "$repo/relative target"; }

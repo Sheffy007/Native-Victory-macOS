@@ -24,6 +24,7 @@ function tomsec(v,   n) {
   return n * 1000
 }
 {
+  if ($0 ~ /^# victory exit status [0-9]+$/) status_line = $0
   ts = ""
   if ($0 ~ /^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) { ts = $1; t = secs(ts); if (!t0) t0 = t; tlast = t; nlines++ }
   line = $0
@@ -142,7 +143,8 @@ END {
   print "-- how it ended"
   if (exc != "") printf "  %s\n  (at +%.1fs, frame~%d)\n", substr(exc, 1, 120), exct, excf
   for (i = 1; i <= nend && i <= 3; i++) print "  " endl[i]
-  if (exc == "" && !nend) print "  no unhandled exception or watchdog line (killed by --seconds or clean exit)"
+  if (status_line != "") print "  " substr(status_line, 3)
+  else if (exc == "" && !nend) print "  exit status unknown (log has no ending marker)"
   printf "  last frame reached: %d\n\n", curframe
 
   if (prof != "") {
@@ -170,8 +172,15 @@ metal: command buffer failed: NSError { code: 2, "Caused GPU Hang Error (0000000
 VIctory: unhandled exception 0xc0000005 at image+0x1234 [0]
 LOG
   out=$(summarise "$f")
+  printf '# victory exit status 37\n' >> "$f"
+  local with_status
+  with_status=$(summarise "$f")
+  : > "$f"
+  local incomplete
+  incomplete=$(summarise "$f")
   rm -f "$f"
   chk() { printf '%s\n' "$out" | grep -q -- "$1" || { echo "self-test FAIL: missing '$1'"; ok=0; }; }
+  [[ "$with_status" == *"victory exit status 37"* && "$incomplete" == *"exit status unknown"* ]] || ok=0
   chk '32.0 fps'; chk '12.50 ms  frame=100 stage="pixel"'; chk '2 .*indirect execution dropped'
   chk 'Hang=1'; chk 'unhandled exception 0xc0000005 at image+0x1234'; chk 'last frame reached: 128'
   chk 'calls 3 total 9.0 ms'; chk '1  translation: code at H: a thing'

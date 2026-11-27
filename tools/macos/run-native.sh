@@ -89,6 +89,7 @@ stop_timer() {
 trap 'pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; stop_timer; wait "$pid"; echo; echo "Stopped. Log: $log"; exit 130' INT TERM
 wait "$pid"
 rc=$?
+printf '# victory exit status %d\n' "$rc" >> "$log"
 stop_timer
 
 echo

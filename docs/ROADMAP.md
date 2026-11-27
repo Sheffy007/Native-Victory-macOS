@@ -2,26 +2,15 @@
 
 Updated 27 November 2026. Each problem lists what is already known, so you don't have to rediscover it. The deep detail, with addresses and every diagnostic switch, is in [native-host.md](native-host.md).
 
-**Where it stands:** the game boots, plays its boot movie, shows the start screen and every setup screen, loads story mode and reaches the prologue. It crashes a few seconds into the prologue. Getting the prologue to play through is the top priority.
+**Where it stands:** On the maintainer's Mac, story mode reaches the prologue world and dialogue plays. The picture is still mostly black and world frames are slow. [Maintainer's report on #15](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/15#issuecomment-7205388027).
 
-## 1. The prologue crash (top priority, [#15](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/15))
+<a id="1-the-prologue-crash-top-priority-15"></a>
 
-Two problems stop it, in this order:
+## 1. Prologue status ([#15](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/15))
 
-1. **A stall on the first world frame trips the game's own watchdog.**
-   - At the first world frame, the game binds about 1,100 pipelines for the first time.
-   - About 69 of them are large compute shaders. Each took 0.2–0.6 s to translate, almost all of it in structurisation (`range::build`), and is then refused. Each was done in turn on the game's thread.
-   - The game's watchdog fires 30 s into the frame: a deliberate null write at `image+0x23cf683`, then the fault at `image+0x55e56f8`.
-   - **Fixed on branch `fix/prologue-crash`:** every shader is translated ahead on host worker threads as the game creates it (`VICTORY_NO_SHADER_PREWARM=1` turns it off). Being checked for memory cost before it lands.
-   - A slowdown in queue submission after merging #76 (resources named at every draw) is being fixed on `fix/fps-decay`.
-2. **Pointers read from data no shader filled in.**
-   - Once in the world, the game reads arrays of *empty* half-float bounding boxes as pointers: `0xfc007c007c007c00`, `0xfc00fc00fc007c00`, or the float32 form `0x7f8000007f800000`. It then reads null+0x10 at `image+0x5592694`.
-   - In both runs that showed it, a Metal assertion came just before: "bytes_per_row >= used_bytes_per_row". It followed the first use of a compute shader refused for "a cross-lane operation between host waves in divergent code".
-   - **Leading guess (not proven):** a refused shader's output buffer keeps its initial empty boxes, and the CPU reads it.
-   - `VICTORY_TRACE_OWNERS=1` names who owns the memory, and `VICTORY_DUMP_REFUSED=<dir>` dumps the refused shaders.
-   - **Ruled out:** linear root views (those shaders go through the page table), pool pages owned twice (fixed by #108; a pool audit finds 0 differences), and GPU command buffers that fail (their signals are now paid on the CPU).
+The GPU memory overwrite is fixed on main. The ray-tracing builder asked for 45 threads. The host launched 45 groups of 64 and wrote empty nodes over neighbouring resources. The Metal host now rounds the thread count up to whole groups and masks the surplus lanes. The [dispatch investigation](native-host.md#dispatchx-with-thread-counts) records the evidence and regression tests.
 
-**Start here:** `crates/victory-gpu/src/native/shaders.rs`, `crates/victory-gpu/src/pipeline.rs`, `crates/victory-metal/src/gfx.rs`, and the run-game skill. `tools/macos/run-summary.sh <log>` shows how a run ended.
+A cold first world frame can still trip the title's 30-second watchdog during pipeline compilation. For a new report on #15, include the commit, console model, cache state and run log. Use `tools/macos/run-summary.sh <log>` to find the last recorded frame and any exception. Rendering, texture copies, frame time, shader caching and compiler failures are tracked separately in [#182](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/182), [#178](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/178), [#179](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/179), [#180](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/180) and [#181](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/181).
 
 ## 2. Frame rate and memory in the world
 
