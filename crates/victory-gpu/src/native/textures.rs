@@ -469,10 +469,10 @@ pub struct Tracked<B: ResourceBackend> {
     last: Option<blake3::Hash>,
     /// Uploads of its memory so far.
     pub uploads: u64,
-    /// Submissions left in which its memory is probed at submission rather than left to the
-    /// scanner (0: cold), and the hash of its samples when it was last read whole (a probe that
-    /// reads others reports a write).
-    hot: u32,
+    /// Submission serial (`Title::sync_serial`) through which its memory is probed at submission
+    /// rather than left to the scanner (0: cold), and the hash of its samples when it was last
+    /// read whole (a probe that reads others reports a write).
+    hot_until: u64,
     probe: Option<blake3::Hash>,
     /// Whether its last write showed in the sampled probe (a movie's planes, a streamed texture:
     /// written whole): then it is read whole only every `WHOLE_EVERY` probes (backing off across
@@ -516,7 +516,7 @@ fn srgb_twin(f: Format) -> Option<Format> {
 }
 
 /// Submissions a texture whose memory changed stays hot without a further change.
-const HOT: u32 = 600;
+pub(super) const HOT: u32 = 600;
 /// Time one submission spends probing hot textures, and again blank ones. Boot movies and UI
 /// glyph caches have a few hot textures and a few hundred blank ones (the movie's planes among
 /// them, blank until the title decodes into them), all of which a submission must reach: a count
@@ -628,44 +628,76 @@ static REPLACED: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU
 /// Probes `keys` round-robin from `cursor`, each at most once. An expired deadline, or
 /// `WHOLE_BUDGET` of whole reads, stops the round after at least `MIN_SYNC_HOT` probes (no deadline:
 /// neither does). Those whose memory changed, and the hot ones to be read whole to tell, go to
-/// `dirty`. Hot textures that stay unchanged cool down and leave; blank ones (`blank`) stay until
-/// they are written.
+/// `dirty`. Hot textures (`hot_serial = Some(sync_serial)`) that stay unchanged for `HOT`
+/// submissions cool down and leave without spending a probe once expired; blank ones (`None`) stay
+/// until they are written.
 fn probe_round<B: ResourceBackend>(
     textures: &mut Textures<B>,
     keys: &mut Vec<usize>,
     cursor: &mut usize,
     until: Option<std::time::Instant>,
-    blank: bool,
+    hot_serial: Option<u64>,
     scratch: &mut Vec<u8>,
     dirty: &mut std::collections::HashSet<usize>,
 ) {
-    let mut left = keys.len();
+    if keys.is_empty() {
+        *cursor = 0;
+        return;
+    }
+    // Partition invariant:
+    // - Before wrap (`wrapped == false`, `start <= idx <= keys.len()`):
+    //   `keys[0..start]` is unvisited, `keys[start..idx]` was visited and kept, and
+    //   `keys[idx..keys.len()]` is unvisited (`swap_remove(idx)` pulls an unvisited tail element).
+    // - After wrap (`wrapped == true`, `0 <= idx <= start <= keys.len()`):
+    //   `keys[0..idx]` was visited after wrap, `keys[idx..start]` is unvisited, and
+    //   `keys[start..keys.len()]` was visited before wrap. Decrementing `start`, swapping `idx`
+    //   with `start` (the last unvisited slot), and `swap_remove(start)` (pulling an already-
+    //   visited tail element into `start`) keeps both visited slices disjoint from `keys[idx..start]`.
+    let remove = |keys: &mut Vec<usize>, idx: usize, start: &mut usize, wrapped: bool| {
+        if wrapped {
+            *start -= 1;
+            keys.swap(idx, *start);
+            keys.swap_remove(*start);
+        } else {
+            keys.swap_remove(idx);
+        }
+    };
+    let mut start = *cursor % keys.len();
+    let mut idx = start;
+    let mut wrapped = false;
     let mut probed = 0;
     // Bytes of the textures to be read whole, and of those among them read so only now and then.
     let mut whole = 0;
     let mut spare = 0;
-    while left > 0 && !keys.is_empty() {
+    loop {
+        if !wrapped && idx >= keys.len() {
+            idx = 0;
+            wrapped = true;
+        }
+        if wrapped && idx >= start {
+            break;
+        }
         if probed >= MIN_SYNC_HOT && until.is_some_and(|until| std::time::Instant::now() >= until || whole >= WHOLE_BUDGET) {
             break;
         }
-        left -= 1;
-        let idx = *cursor % keys.len();
         let key = keys[idx];
-        let Some(t) = textures.get_mut(&key).filter(|t| if blank { t.blank } else { t.hot > 0 }) else {
-            keys.swap_remove(idx);
+        let Some(t) = textures.get_mut(&key) else {
+            remove(keys, idx, &mut start, wrapped);
             continue;
         };
+        if let Some(sync_serial) = hot_serial {
+            if t.hot_until == 0 || t.hot_until < sync_serial {
+                t.hot_until = 0;
+                remove(keys, idx, &mut start, wrapped);
+                continue;
+            }
+        } else if !t.blank {
+            remove(keys, idx, &mut start, wrapped);
+            continue;
+        }
         probed += 1;
         let at = t.info.memory as usize;
-        let leave = if blank {
-            // Written at last.
-            let written = probe_nonzero(at, t.info.size, scratch);
-            if written {
-                dirty.insert(key);
-                t.blank = false;
-            }
-            written
-        } else {
+        let leave = if let Some(sync_serial) = hot_serial {
             let sampled = probe_hash(at, t.info.size, false, scratch);
             // Its samples at the last upload (`sync_apply` moves them on).
             let before = t.probe;
@@ -694,17 +726,26 @@ fn probe_round<B: ResourceBackend>(
             }
             if changed {
                 dirty.insert(key);
-            } else {
-                t.hot -= 1;
+            } else if t.hot_until <= sync_serial {
+                t.hot_until = 0;
             }
-            t.hot == 0
+            t.hot_until == 0
+        } else {
+            // Written at last.
+            let written = probe_nonzero(at, t.info.size, scratch);
+            if written {
+                dirty.insert(key);
+                t.blank = false;
+            }
+            written
         };
         if leave {
-            keys.swap_remove(idx);
+            remove(keys, idx, &mut start, wrapped);
         } else {
-            *cursor = idx + 1;
+            idx += 1;
         }
     }
+    *cursor = idx;
 }
 
 /// The key of a texture a view names by address and description (no resource object): a number no
@@ -853,7 +894,7 @@ impl<B: PresentBackend> Title<B> {
                 serial,
                 last: None,
                 uploads: 0,
-                hot: 0,
+                hot_until: 0,
                 probe: None,
                 sampled_sees_writes: false,
                 unchanged_whole: 0,
@@ -938,7 +979,7 @@ impl<B: PresentBackend> Title<B> {
         let key = self.shared.iter().find(|(_, (_, placed))| *placed == key).map_or(key, |(&object, _)| object);
         if let Some(t) = self.textures.get_mut(&key) {
             t.gpu_written = true;
-            (t.hot, t.blank) = (0, false);
+            (t.hot_until, t.blank) = (0, false);
         }
     }
 
@@ -1081,7 +1122,8 @@ impl<B: PresentBackend> Title<B> {
 
     /// [`Self::sync_jobs`] with `budget` of time for each round of probes (none: every hot and
     /// blank texture is probed).
-    fn sync_jobs_within(&mut self, budget: Option<std::time::Duration>) -> Vec<Job> {
+    pub(super) fn sync_jobs_within(&mut self, budget: Option<std::time::Duration>) -> Vec<Job> {
+        self.sync_serial = self.sync_serial.wrapping_add(1);
         self.release_placed();
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
@@ -1089,11 +1131,11 @@ impl<B: PresentBackend> Title<B> {
         // the ones that changed lately first, then the blank ones.
         let started = std::time::Instant::now();
         let until = budget.map(|budget| started + budget);
-        probe_round(&mut self.textures, &mut self.hot_keys, &mut self.hot_cursor, until, false, &mut self.probe_buf, &mut dirty);
+        probe_round(&mut self.textures, &mut self.hot_keys, &mut self.hot_cursor, until, Some(self.sync_serial), &mut self.probe_buf, &mut dirty);
         // The blank ones get a budget of their own: a busy movie must not starve its next planes.
         let hot = std::time::Instant::now();
         let until = budget.map(|budget| hot + budget);
-        probe_round(&mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, true, &mut self.probe_buf, &mut dirty);
+        probe_round(&mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, None, &mut self.probe_buf, &mut dirty);
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
             SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log();
         }
@@ -1128,6 +1170,7 @@ impl<B: PresentBackend> Title<B> {
         let Title {
             host,
             textures,
+            sync_serial,
             hot_keys,
             blank_keys,
             stats,
@@ -1176,11 +1219,11 @@ impl<B: PresentBackend> Title<B> {
                 if r.blank && !t.blank {
                     blank_keys.push(key);
                 } else if !r.blank && t.uploads > 0 {
-                    // Written again after its first upload: hot.
-                    if t.hot == 0 {
+                    // Written again after its first upload: hot for the next `HOT` submissions.
+                    if t.hot_until == 0 {
                         hot_keys.push(key);
                     }
-                    t.hot = HOT;
+                    t.hot_until = sync_serial.wrapping_add(u64::from(HOT));
                 }
                 t.blank = r.blank;
             }
@@ -1763,5 +1806,235 @@ mod tests {
         assert_eq!((reads, queries), (1, 1));
         assert!(out[..2 * page].iter().all(|&b| b == 0x5a));
         assert!(out[2 * page..].iter().all(|&b| b == 0xa5));
+    }
+
+    #[test]
+    fn probe_round_wraparound_removals_visit_each_live_entry_once() {
+        use crate::native::vertex_tests::Capture;
+        use victory_formats::texture::{Desc, Swizzle};
+
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 4,
+            height: 4,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        let mem = [0x42u8; 256];
+        let mut scratch = Vec::new();
+        let probe = probe_hash(mem.as_ptr() as usize, mem.len(), false, &mut scratch);
+        let sync_serial = 10u64;
+
+        let make_tracked = |hot_until: u64| Tracked::<Capture> {
+            texture: Rc::new(TextureDesc::d2(Format::Rgba8Unorm, 4, 4)),
+            info: TextureInfo {
+                dimension: Dimension::Tex2d,
+                format: 28,
+                width: 4,
+                height: 4,
+                depth_or_layers: 1,
+                flags: 0,
+                layout: layout.clone(),
+                memory: mem.as_ptr(),
+                size: mem.len(),
+            },
+            serial: 1,
+            last: Some(blake3::hash(&mem)),
+            uploads: 2,
+            hot_until,
+            probe: Some(probe),
+            sampled_sees_writes: true,
+            unchanged_whole: 1,
+            skipped: 0,
+            partial: false,
+            blank: false,
+            target_views: Vec::new(),
+            gpu_written: false,
+        };
+
+        // 1. Explicit trace removing entries after wraparound (`cursor = 4` on 6 entries `[0..6]`,
+        //    so `[4, 5]` are visited before wrap and `[0, 2]` are removed after wrap while `[1, 3]`
+        //    survive).
+        let mut textures: Textures<Capture> = [
+            (0, make_tracked(5)),  // expired before probe (removed after wrap)
+            (1, make_tracked(20)), // survives after wrap
+            (2, make_tracked(10)), // probed once, then cools (`hot_until == sync_serial`) after wrap
+            (3, make_tracked(20)), // survives after wrap
+            (4, make_tracked(20)), // visited and kept before wrap
+            (5, make_tracked(20)), // visited and kept before wrap
+        ]
+        .into_iter()
+        .collect();
+        let mut keys = vec![0, 1, 2, 3, 4, 5];
+        let mut cursor = 4usize;
+        let mut dirty = HashSet::new();
+        probe_round(
+            &mut textures,
+            &mut keys,
+            &mut cursor,
+            None,
+            Some(sync_serial),
+            &mut scratch,
+            &mut dirty,
+        );
+        assert!(dirty.is_empty());
+        assert_eq!(textures[&0].skipped, 0, "expired entry evicted without probing");
+        for k in [1, 2, 3, 4, 5] {
+            assert_eq!(textures[&k].skipped, 1, "live entry {k} must be visited once, not skipped or visited twice");
+        }
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![1, 3, 4, 5]);
+
+        // 2. Exhaustive check across all 6 initial cursor positions and all 3^6 = 729 combinations
+        //    of (already expired = 5, cools after probe = 10, stays hot = 20): 4,374 schedules.
+        const N: usize = 6;
+        for total_states in 0..3usize.pow(N as u32) {
+            let mut state = [0u64; N];
+            let mut rem = total_states;
+            for s in &mut state {
+                *s = match rem % 3 {
+                    0 => 5,
+                    1 => 10,
+                    _ => 20,
+                };
+                rem /= 3;
+            }
+            for start_cursor in 0..N {
+                let mut textures: Textures<Capture> = (0..N)
+                    .map(|k| (k, make_tracked(state[k])))
+                    .collect();
+                let mut keys: Vec<usize> = (0..N).collect();
+                let mut cursor = start_cursor;
+                let mut dirty = HashSet::new();
+                probe_round(
+                    &mut textures,
+                    &mut keys,
+                    &mut cursor,
+                    None,
+                    Some(sync_serial),
+                    &mut scratch,
+                    &mut dirty,
+                );
+                let mut want_survivors = Vec::new();
+                for k in 0..N {
+                    let expected_visits = u32::from(state[k] >= sync_serial);
+                    assert_eq!(
+                        textures[&k].skipped, expected_visits,
+                        "state={state:?} start={start_cursor} key={k}"
+                    );
+                    if state[k] > sync_serial {
+                        want_survivors.push(k);
+                    } else {
+                        assert_eq!(textures[&k].hot_until, 0);
+                    }
+                }
+                keys.sort_unstable();
+                assert_eq!(keys, want_survivors, "state={state:?} start={start_cursor}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_hot_texture_serial_cooling_under_probe_budget() {
+        use crate::native::vertex_tests::Capture;
+        use std::time::{Duration, Instant};
+        use victory_formats::texture::{Desc, Swizzle};
+
+        const N: usize = 5_000;
+        const SUBMISSIONS: u64 = 800;
+        const SIZE: usize = 64 << 10;
+        let backing = vec![0x5au8; N * SIZE];
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 128,
+            height: 128,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        let mut scratch = Vec::new();
+        let mut textures: Textures<Capture> = (0..N)
+            .map(|i| {
+                let ptr = unsafe { backing.as_ptr().add(i * SIZE) };
+                let probe = probe_hash(ptr as usize, SIZE, false, &mut scratch);
+                (
+                    i,
+                    Tracked {
+                        texture: Rc::new(TextureDesc::d2(Format::Rgba8Unorm, 128, 128)),
+                        info: TextureInfo {
+                            dimension: Dimension::Tex2d,
+                            format: 28,
+                            width: 128,
+                            height: 128,
+                            depth_or_layers: 1,
+                            flags: 0,
+                            layout: layout.clone(),
+                            memory: ptr,
+                            size: SIZE,
+                        },
+                        serial: 1,
+                        last: None,
+                        uploads: 1,
+                        hot_until: u64::from(HOT),
+                        probe: Some(probe),
+                        sampled_sees_writes: true,
+                        unchanged_whole: 1,
+                        skipped: 0,
+                        partial: false,
+                        blank: false,
+                        target_views: Vec::new(),
+                        gpu_written: false,
+                    },
+                )
+            })
+            .collect();
+        let mut keys: Vec<usize> = (0..N).collect();
+        let mut cursor = 0usize;
+        let mut dirty = HashSet::new();
+        let mut early_ms = 0.0;
+        let mut post_cool_ms = 0.0;
+        for s in 1..=SUBMISSIONS {
+            let t0 = Instant::now();
+            probe_round(
+                &mut textures,
+                &mut keys,
+                &mut cursor,
+                Some(t0 + PROBE_BUDGET),
+                Some(s),
+                &mut scratch,
+                &mut dirty,
+            );
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if s <= u64::from(HOT) {
+                early_ms += ms;
+            } else {
+                post_cool_ms += ms;
+            }
+            let _ = Duration::ZERO;
+        }
+        eprintln!(
+            "BENCH #252 ({N} hot 64 KiB textures, {SUBMISSIONS} submissions, 2 ms budget):\n\
+             - submissions 1..={HOT}: avg {:.3} ms/sub (budget-bound at 2.0 ms)\n\
+             - submission {}: hot_keys remaining = {} (vs {N} under per-visit decrement until ~{} submissions)\n\
+             - submissions {}..={SUBMISSIONS}: avg {:.4} ms/sub",
+            early_ms / f64::from(HOT),
+            SUBMISSIONS,
+            keys.len(),
+            N * HOT as usize / 180,
+            HOT + 1,
+            post_cool_ms / (SUBMISSIONS - u64::from(HOT)) as f64,
+        );
+        assert_eq!(keys.len(), 0);
     }
 }

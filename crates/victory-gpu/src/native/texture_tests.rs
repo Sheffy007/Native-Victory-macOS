@@ -111,7 +111,9 @@ fn a_tiled_title_texture_is_detiled_into_the_host_texture() {
 }
 
 /// Held by the tests that count on a texture staying hot: the many submissions of
-/// `a_texture_blank_for_thousands_of_submissions_is_still_probed` cool every other test's textures.
+/// `a_texture_blank_for_thousands_of_submissions_is_still_probed` and
+/// `hot_textures_cool_by_submissions_even_when_probe_round_is_capped` cool every other test's
+/// textures.
 static AGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A texture uploaded blank and written whole later (a movie's planes) is uploaded again at the
@@ -299,6 +301,57 @@ fn a_hot_texture_is_probed_at_each_submission_among_hundreds() {
         assert_eq!(probed, N, "all {N} blank textures probed in one submission");
         let seen = keys.iter().filter(|&&k| t.uploads_of(k) == 2).count();
         assert_eq!(seen, N, "all {N} hot textures written, seen at the next submission");
+    });
+}
+
+/// Hundreds of hot textures cool after `HOT` submissions even when each submission's probe budget
+/// can visit only `MIN_SYNC_HOT` of them, while a texture written again inside the window stays hot.
+#[test]
+fn hot_textures_cool_by_submissions_even_when_probe_round_is_capped() {
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+    const N: usize = 128;
+    const STRIDE: usize = 64 << 10;
+    let Some(pool) = pool(9132, N * STRIDE / page_size() + 1) else { return };
+    let keys: Vec<usize> = (0..N)
+        .map(|i| crate::resource::test_texture_at(pool.va(i * STRIDE), (64, 64), 1, 28, Swizzle::LINEAR.0, 0) as usize)
+        .collect();
+    let size = crate::resource::texture_info(keys[0] as _).unwrap().size;
+    let refreshed = keys[N - 1];
+    with_title(|t| {
+        for &k in &keys {
+            assert!(t.realize(k));
+        }
+        t.sync_dirty_without_probe_deadline();
+        assert!(keys.iter().all(|&k| t.uploads_of(k) == 1));
+        let first = vec![0x33u8; size];
+        for i in 0..N {
+            pool.write(i * STRIDE, &first);
+        }
+        t.sync_dirty_without_probe_deadline();
+        assert!(keys.iter().all(|&k| t.uploads_of(k) == 2 && t.hot_keys.contains(&k)));
+
+        let hot = crate::native::textures::HOT as usize;
+        for step in 0..hot {
+            if step == hot / 2 {
+                pool.write((N - 1) * STRIDE, &vec![0x77u8; size]);
+                t.sync_dirty_without_probe_deadline();
+                assert_eq!(t.uploads_of(refreshed), 3);
+                continue;
+            }
+            let jobs = t.sync_jobs_within(Some(std::time::Duration::ZERO));
+            t.sync(jobs);
+        }
+        // One unbounded pass visits the whole list regardless of other tests' hot textures,
+        // evicting every expired entry after `HOT` capped submissions.
+        t.sync_dirty_without_probe_deadline();
+
+        let still_hot = keys[..N - 1].iter().filter(|&&k| t.hot_keys.contains(&k)).count();
+        assert_eq!(still_hot, 0, "all unchanged textures cooled after HOT submissions");
+        assert!(t.hot_keys.contains(&refreshed), "texture written inside the window stays hot");
+
+        pool.write((N - 1) * STRIDE, &vec![0xCCu8; size]);
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(refreshed), 4, "still-hot texture is probed on the next submission");
     });
 }
 

@@ -209,7 +209,10 @@ pub struct Title<B: PresentBackend> {
     pub(super) back: super::textures::Back<B>,
     /// Sampled textures realized but not yet uploaded once.
     pub(super) unloaded: std::collections::HashSet<usize>,
-    /// Keys of textures currently in the fast per-submission probe set (`hot > 0`).
+    /// Submission sync serial advanced by `Title::sync_jobs_within`, used to expire `hot_keys`
+    /// after `HOT` submissions even when a round-robin probe budget cannot visit all of them.
+    pub(super) sync_serial: u64,
+    /// Keys of textures currently in the fast per-submission probe set (`hot_until > 0`).
     pub(super) hot_keys: Vec<usize>,
     /// Round-robin cursor into `hot_keys` when the time budget ends before all are probed.
     pub(super) hot_cursor: usize,
@@ -254,6 +257,7 @@ impl<B: PresentBackend> Title<B> {
             textures: Default::default(),
             back: Default::default(),
             unloaded: std::collections::HashSet::new(),
+            sync_serial: 0,
             hot_keys: Vec::new(),
             hot_cursor: 0,
             blank_keys: Vec::new(),
